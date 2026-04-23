@@ -1,4 +1,4 @@
-"""Unit tests for KafkaConfig and PostgresConfig Pydantic models.
+"""Unit tests for KafkaConfig, PostgresConfig and SchemaRegistryConfig models.
 
 These tests run without Docker — no external services required.
 """
@@ -6,7 +6,11 @@ These tests run without Docker — no external services required.
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from streaming_feature_store.config import KafkaConfig, PostgresConfig
+from streaming_feature_store.config import (
+    KafkaConfig,
+    PostgresConfig,
+    SchemaRegistryConfig,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -247,3 +251,111 @@ class TestPostgresConfigEnvOverride:
         monkeypatch.setenv("POSTGRES_PASSWORD", "s3cr3t")
         cfg = PostgresConfig()
         assert cfg.password.get_secret_value() == "s3cr3t"
+
+
+# ---------------------------------------------------------------------------
+# SchemaRegistryConfig
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaRegistryConfigDefaults:
+    """Verify default values for SchemaRegistryConfig."""
+
+    def test_url(self) -> None:
+        cfg = SchemaRegistryConfig()
+        assert cfg.url == "http://localhost:8081"
+
+    def test_default_compatibility(self) -> None:
+        cfg = SchemaRegistryConfig()
+        assert cfg.default_compatibility == "BACKWARD"
+
+    def test_request_timeout_s(self) -> None:
+        cfg = SchemaRegistryConfig()
+        assert cfg.request_timeout_s == 5.0
+
+
+class TestSchemaRegistryConfigUrls:
+    """Verify derived endpoint URL properties."""
+
+    def test_subjects_url_default(self) -> None:
+        cfg = SchemaRegistryConfig()
+        assert cfg.subjects_url == "http://localhost:8081/subjects"
+
+    def test_config_url_default(self) -> None:
+        cfg = SchemaRegistryConfig()
+        assert cfg.config_url == "http://localhost:8081/config"
+
+    def test_subjects_url_strips_trailing_slash(self) -> None:
+        cfg = SchemaRegistryConfig(url="http://sr.example:8081/")
+        assert cfg.subjects_url == "http://sr.example:8081/subjects"
+
+    def test_config_url_strips_trailing_slash(self) -> None:
+        cfg = SchemaRegistryConfig(url="http://sr.example:8081/")
+        assert cfg.config_url == "http://sr.example:8081/config"
+
+
+class TestSchemaRegistryConfigValidation:
+    """Verify Pydantic validation rejects invalid values."""
+
+    def test_rejects_unknown_compatibility(self) -> None:
+        with pytest.raises(ValidationError):
+            SchemaRegistryConfig(default_compatibility="SIDEWAYS")
+
+    def test_rejects_empty_compatibility(self) -> None:
+        with pytest.raises(ValidationError):
+            SchemaRegistryConfig(default_compatibility="")
+
+    def test_rejects_zero_timeout(self) -> None:
+        with pytest.raises(ValidationError):
+            SchemaRegistryConfig(request_timeout_s=0)
+
+    def test_rejects_negative_timeout(self) -> None:
+        with pytest.raises(ValidationError):
+            SchemaRegistryConfig(request_timeout_s=-1.0)
+
+    @pytest.mark.parametrize(
+        "level",
+        [
+            "BACKWARD",
+            "BACKWARD_TRANSITIVE",
+            "FORWARD",
+            "FORWARD_TRANSITIVE",
+            "FULL",
+            "FULL_TRANSITIVE",
+            "NONE",
+        ],
+    )
+    def test_accepts_all_valid_levels(self, level: str) -> None:
+        cfg = SchemaRegistryConfig(default_compatibility=level)
+        assert cfg.default_compatibility == level
+
+
+class TestSchemaRegistryConfigCustomValues:
+    """Verify that custom constructor values are accepted."""
+
+    def test_custom_url(self) -> None:
+        cfg = SchemaRegistryConfig(url="http://registry.prod:9999")
+        assert cfg.url == "http://registry.prod:9999"
+
+    def test_custom_timeout(self) -> None:
+        cfg = SchemaRegistryConfig(request_timeout_s=10.0)
+        assert cfg.request_timeout_s == 10.0
+
+
+class TestSchemaRegistryConfigEnvOverride:
+    """Verify environment-variable-based overrides via monkeypatch."""
+
+    def test_url_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SCHEMA_REGISTRY_URL", "http://env-sr:8081")
+        cfg = SchemaRegistryConfig()
+        assert cfg.url == "http://env-sr:8081"
+
+    def test_compatibility_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SCHEMA_REGISTRY_DEFAULT_COMPATIBILITY", "FULL")
+        cfg = SchemaRegistryConfig()
+        assert cfg.default_compatibility == "FULL"
+
+    def test_timeout_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SCHEMA_REGISTRY_REQUEST_TIMEOUT_S", "2.5")
+        cfg = SchemaRegistryConfig()
+        assert cfg.request_timeout_s == 2.5

@@ -2,6 +2,7 @@ COMPOSE_FILE := docker/docker-compose.yml
 
 .PHONY: infra-up infra-down infra-status infra-logs infra-clean \
         kafka-topics kafka-describe psql \
+        schema-subjects schema-compat \
         test test-unit test-integration install
 
 # ---------------------------------------------------------------------------
@@ -44,6 +45,16 @@ kafka-describe:  ## Describe all topics (partitions, replicas, ISR)
 psql:  ## Open an interactive psql shell
 	docker compose -f $(COMPOSE_FILE) exec postgres \
 		psql -U featurestore -d feature_store
+
+# ---------------------------------------------------------------------------
+# Schema Registry helpers
+# ---------------------------------------------------------------------------
+
+schema-subjects:  ## List registered Schema Registry subjects
+	@curl -fsS http://localhost:8081/subjects | jq .
+
+schema-compat:  ## Show Schema Registry default compatibility level
+	@curl -fsS http://localhost:8081/config | jq .
 
 # ---------------------------------------------------------------------------
 # Python / tests

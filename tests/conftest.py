@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 _KAFKA_EXTERNAL_PORTS = [19092, 19093, 19094]
 _POSTGRES_PORT = 5432
+_SCHEMA_REGISTRY_PORT = 8081
 _HOST = "localhost"
 _HEALTH_TIMEOUT_SECONDS = 60
 
@@ -81,7 +82,7 @@ def docker_services_up(docker_compose_file: str) -> None:
     RuntimeError
         If services do not become healthy within the configured timeout.
     """
-    all_ports = _KAFKA_EXTERNAL_PORTS + [_POSTGRES_PORT]
+    all_ports = _KAFKA_EXTERNAL_PORTS + [_POSTGRES_PORT, _SCHEMA_REGISTRY_PORT]
     all_up = all(_wait_for_tcp(_HOST, p, timeout=2) for p in all_ports)
 
     if not all_up:
@@ -136,3 +137,36 @@ def postgres_dsn() -> str:
     from streaming_feature_store.config import PostgresConfig
 
     return PostgresConfig().dsn_with_password()
+
+
+# ---------------------------------------------------------------------------
+# Schema Registry fixtures (integration)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def schema_registry_url() -> str:
+    """Return the Schema Registry base URL for the test cluster.
+
+    Returns
+    -------
+    str
+        Base URL for the Confluent Schema Registry REST API.
+    """
+    from streaming_feature_store.config import SchemaRegistryConfig
+
+    return SchemaRegistryConfig().url
+
+
+@pytest.fixture(scope="session")
+def schema_registry_timeout_s() -> float:
+    """Return the Schema Registry HTTP timeout in seconds.
+
+    Returns
+    -------
+    float
+        HTTP timeout for Schema Registry REST calls.
+    """
+    from streaming_feature_store.config import SchemaRegistryConfig
+
+    return SchemaRegistryConfig().request_timeout_s

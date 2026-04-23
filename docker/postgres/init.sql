@@ -1,6 +1,6 @@
 -- PostgreSQL initialization script for the streaming feature store.
 -- This script is executed automatically by the postgres container on first start.
--- See docs/design/week1_kafka_postgres_docker_setup.md §2.6 for schema rationale.
+-- See docs/design/week1_01_docker_compose_infra.md §2.6 for schema rationale.
 
 -- ---------------------------------------------------------------------------
 -- raw_events: landing table for all Kafka-ingested events

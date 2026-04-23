@@ -1,10 +1,11 @@
-# Design Doc: Multi-Broker Kafka Cluster & PostgreSQL in Docker Compose
+# Design Doc: Multi-Broker Kafka Cluster, PostgreSQL & Schema Registry in Docker Compose
 
 **Phase:** 1 — Real-Time Feature Store & Streaming Pipeline
 **Week:** 1 — Kafka Fundamentals & Event Ingestion
-**Scope:** First bulletpoint — Docker Compose infrastructure setup
+**Scope:** First bulletpoint — Docker Compose infrastructure setup (Kafka + PostgreSQL + Confluent Schema Registry)
 **Author:** Auto-generated design document
 **Date:** 2026-03-24
+**Last Updated:** 2026-04-19 — Added Confluent Schema Registry service per revised Week 1 plan
 
 ---
 
@@ -26,19 +27,20 @@
 ## 1. Overview
 
 This PR sets up the foundational infrastructure for the entire Phase 1 project: a
-multi-broker Apache Kafka cluster and a PostgreSQL database, orchestrated via Docker
-Compose. This infrastructure supports all subsequent Week 1–5 work, including event
-ingestion, stream processing, feature serving, and offline feature computation.
+multi-broker Apache Kafka cluster, a PostgreSQL database, and a Confluent Schema
+Registry, orchestrated via Docker Compose. This infrastructure supports all subsequent
+Week 1–5 work, including event ingestion, Avro/Protobuf schema management, stream
+processing, feature serving, and offline feature computation.
 
 ### Deliverables
 
-- `docker-compose.yml` — 3-broker Kafka cluster (KRaft mode) + PostgreSQL
+- `docker-compose.yml` — 3-broker Kafka cluster (KRaft mode) + PostgreSQL + Confluent Schema Registry
 - PostgreSQL initialization script with `raw_events` table schema
-- Pydantic configuration models for Kafka and PostgreSQL connection settings
+- Pydantic configuration models for Kafka, PostgreSQL, and Schema Registry connection settings
 - Health-check mechanisms for all services
 - Unit tests for configuration models and schema validation
-- Integration tests verifying cluster formation and basic connectivity
-- A `Makefile` (or equivalent) for common operations (start, stop, status, logs)
+- Integration tests verifying cluster formation, basic connectivity, and Schema Registry reachability
+- A `Makefile` (or equivalent) for common operations (start, stop, status, logs, schema subjects listing)
 
 ---
 
@@ -183,16 +185,39 @@ CREATE INDEX idx_raw_events_user_timestamp
   between dev sessions. Bind mounts are avoided to keep the setup cross-platform
   (Windows path issues).
 
-### 2.8 No Schema Registry (Yet)
+### 2.8 Confluent Schema Registry
 
-**Decision:** Do not include Confluent Schema Registry in this PR.
+**Decision:** Include Confluent Schema Registry (`confluentinc/cp-schema-registry`) as a
+5th service in the Docker Compose stack.
 
 **Rationale:**
-- The Week 1 plan focuses on Kafka fundamentals: cluster setup, partitioning, consumer
-  groups, and exactly-once semantics. Schema evolution is not in scope.
-- Adding Schema Registry increases resource usage and Docker Compose complexity.
-- If needed later (Week 2+ for Avro/Protobuf schemas), it can be added as a separate
-  service with minimal disruption.
+- The revised Week 1 plan requires Avro (or Protobuf) schemas registered with a Schema
+  Registry, plus `BACKWARD` compatibility experiments in follow-up Week 1 PRs. The
+  infrastructure needs to be ready from the start.
+- Confluent's `cp-schema-registry` image is the reference implementation, licensed under
+  the Confluent Community License (free to use). It is compatible with Apache Kafka
+  brokers — it only uses Kafka itself as its durable storage backend (the
+  `_schemas` topic).
+- Shipping Schema Registry alongside Kafka from the very first PR avoids a later
+  Compose-file refactor and ensures every subsequent Week 1 PR (producer, consumer,
+  sink) can rely on it being present.
+
+**Configuration:**
+- Image: `confluentinc/cp-schema-registry:7.8.0` (paired with Apache Kafka 3.9.x)
+- Port: `8081` (exposed on host for tooling access)
+- Storage backend: the Kafka cluster itself via `SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS=PLAINTEXT://kafka-1:9092,kafka-2:9092,kafka-3:9092`
+- `_schemas` topic replication factor: `3` (production-grade, matches the cluster's
+  default replication factor)
+- Default compatibility level: left at Kafka's default (`BACKWARD`) — the Week 1 schema
+  evolution PR will explicitly re-assert this and run compatibility experiments against
+  it
+- Depends on all 3 Kafka brokers being healthy (`depends_on` with `condition: service_healthy`)
+
+**Trade-off:** Schema Registry adds ~512 MB RAM and one more JVM to the stack. On a
+16 GB+ laptop this is comfortably within budget (see §8.1). The alternative — compiled
+Protobuf objects without a registry — was considered but rejected because the revised
+Week 1 plan explicitly calls for schema evolution experiments using a registry's
+compatibility modes.
 
 > **Industry Note — Schema Registry Best Practice:**
 > At scale, the standard approach combines **schema-as-code** with the **Confluent Schema
@@ -238,19 +263,23 @@ CREATE INDEX idx_raw_events_user_timestamp
 │                          │                                        │
 │   ┌──────────────────────┴───────────────────────┐               │
 │   │               feature-store-net               │               │
-│   └──────────────────────┬───────────────────────┘               │
+│   └──┬───────────────────┬───────────────────┬───┘               │
+│      │                   │                   │                    │
+│ ┌────┴────────┐   ┌──────┴────────┐   ┌──────┴──────────┐        │
+│ │ PostgreSQL   │   │ schema-registry│   │  (future:       │        │
+│ │ :5432        │   │ :8081          │   │   redis, etc.)  │        │
+│ │ ext:5432     │   │ ext:8081       │   │                 │        │
+│ └─────────────┘   └────────────────┘   └─────────────────┘        │
 │                          │                                        │
-│                  ┌───────┴────────┐                               │
-│                  │   PostgreSQL    │                               │
-│                  │   :5432         │                               │
-│                  │   ext:5432      │                               │
-│                  └────────────────┘                               │
+│                          └── stores schemas in `_schemas`         │
+│                              topic on the Kafka cluster           │
 │                                                                  │
 └──────────────────────────────────────────────────────────────────┘
 
 Host machine (Python producer/consumer) connects via:
-  - Kafka: localhost:19092, localhost:19093, localhost:19094
-  - PostgreSQL: localhost:5432
+  - Kafka:           localhost:19092, localhost:19093, localhost:19094
+  - PostgreSQL:      localhost:5432
+  - Schema Registry: localhost:8081  (HTTP REST API)
 ```
 
 ---
@@ -284,7 +313,8 @@ streaming-feature-store/
 
 ### 4.2 `docker-compose.yml`
 
-The Compose file defines 4 services: `kafka-1`, `kafka-2`, `kafka-3`, and `postgres`.
+The Compose file defines 5 services: `kafka-1`, `kafka-2`, `kafka-3`, `postgres`, and
+`schema-registry`.
 
 **Key configuration per Kafka broker:**
 
@@ -328,12 +358,31 @@ The Compose file defines 4 services: `kafka-1`, `kafka-2`, `kafka-3`, and `postg
 - Memory: 512 MB limit
 - CPUs: 1.0
 
+**Schema Registry service configuration:**
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| Image | `confluentinc/cp-schema-registry:7.8.0` | Confluent Community edition; paired with Kafka 3.9.x |
+| `SCHEMA_REGISTRY_HOST_NAME` | `schema-registry` | Advertised hostname on the Docker network |
+| `SCHEMA_REGISTRY_LISTENERS` | `http://0.0.0.0:8081` | HTTP REST listener |
+| `SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS` | `PLAINTEXT://kafka-1:9092,kafka-2:9092,kafka-3:9092` | All 3 brokers via the internal listener |
+| `SCHEMA_REGISTRY_KAFKASTORE_TOPIC` | `_schemas` | Default storage topic name |
+| `SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR` | `3` | Match cluster replication factor |
+| `SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL` | `backward` | Default compatibility (explicit for clarity; Kafka's default is also `backward`) |
+| Port mapping | `8081:8081` | Host access for tooling / curl |
+| `depends_on` | kafka-1, kafka-2, kafka-3 (all `service_healthy`) | Registry requires a reachable Kafka quorum on startup |
+
+**Resource limits for Schema Registry:**
+- Memory: 512 MB limit (~256 MB JVM heap + overhead)
+- CPUs: 0.5
+
 **Health checks:**
 
 | Service | Health Check Command | Interval | Retries |
 |---------|---------------------|----------|---------|
 | kafka-* | `/opt/kafka/bin/kafka-metadata.sh --snapshot /tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log --cluster-id <id>` or use a TCP check on port 9092 | 10s | 10 |
 | postgres | `pg_isready -U featurestore -d feature_store` | 5s | 5 |
+| schema-registry | `curl -fsS http://localhost:8081/subjects` (returns HTTP 200 once the Kafka-backed store is initialized) | 10s | 10 |
 
 **Note on Kafka health checks:** The simplest reliable health check for KRaft-mode Kafka
 is to use `kafka-broker-api-versions.sh --bootstrap-server localhost:9092` or a basic TCP
@@ -483,6 +532,42 @@ class PostgresConfig(BaseSettings):
             f"postgresql://{self.user}:{self.password.get_secret_value()}"
             f"@{self.host}:{self.port}/{self.database}"
         )
+
+
+class SchemaRegistryConfig(BaseSettings):
+    """Configuration for connecting to Confluent Schema Registry.
+
+    Parameters
+    ----------
+    url : str
+        Base HTTP URL for the Schema Registry REST API.
+    default_compatibility : str
+        Default subject compatibility level used when registering new schemas.
+    request_timeout_s : float
+        HTTP request timeout in seconds for registry calls.
+
+    Notes
+    -----
+    Values can be overridden via environment variables
+    prefixed with ``SCHEMA_REGISTRY_`` (e.g. ``SCHEMA_REGISTRY_URL``).
+    """
+
+    url: str = Field(
+        default="http://localhost:8081",
+        description="Base HTTP URL for the Schema Registry REST API",
+    )
+    default_compatibility: str = Field(
+        default="BACKWARD",
+        pattern=r"^(BACKWARD|BACKWARD_TRANSITIVE|FORWARD|FORWARD_TRANSITIVE|FULL|FULL_TRANSITIVE|NONE)$",
+        description="Default subject compatibility level",
+    )
+    request_timeout_s: float = Field(
+        default=5.0,
+        gt=0,
+        description="HTTP request timeout in seconds",
+    )
+
+    model_config = {"env_prefix": "SCHEMA_REGISTRY_"}
 ```
 
 ### 4.5 `Makefile`
@@ -520,6 +605,12 @@ kafka-describe:          ## Describe all topics
 psql:                    ## Open psql shell
 	docker compose -f $(COMPOSE_FILE) exec postgres \
 		psql -U featurestore -d feature_store
+
+schema-subjects:         ## List registered schema subjects
+	curl -fsS http://localhost:8081/subjects | jq .
+
+schema-compat:           ## Show default compatibility level
+	curl -fsS http://localhost:8081/config | jq .
 ```
 
 ---
@@ -545,6 +636,10 @@ model constraints. These use `pytest` with no external dependencies.
 | `test_postgres_config_password_is_secret` | `password` field is a `SecretStr` instance, and `str(config.password)` does not reveal the value |
 | `test_postgres_config_invalid_port` | `PostgresConfig` rejects port `0` and port `70000` (outside valid range) |
 | `test_postgres_config_env_override` | `PostgresConfig` reads from `POSTGRES_HOST`, `POSTGRES_PORT`, etc. environment variables |
+| `test_schema_registry_config_defaults` | Default `SchemaRegistryConfig` values are correct (`url=http://localhost:8081`, `default_compatibility=BACKWARD`, `request_timeout_s=5.0`) |
+| `test_schema_registry_config_invalid_compatibility` | `SchemaRegistryConfig` rejects an unknown compatibility level (e.g. `"SIDEWAYS"`) via the regex `pattern` |
+| `test_schema_registry_config_invalid_timeout` | `SchemaRegistryConfig` rejects non-positive `request_timeout_s` (`0`, negative values) |
+| `test_schema_registry_config_env_override` | `SchemaRegistryConfig` reads from `SCHEMA_REGISTRY_URL` and `SCHEMA_REGISTRY_DEFAULT_COMPATIBILITY` environment variables |
 
 ### 5.2 `tests/unit/test_init_sql.py`
 
@@ -589,6 +684,9 @@ that the cluster is healthy, services are reachable, and basic operations succee
 | `test_postgres_raw_events_indexes` | Query `pg_indexes` for the `raw_events` table | All 4 indexes + primary key index exist |
 | `test_postgres_insert_and_query` | Insert a sample event row into `raw_events`, then query it back | Inserted row matches on all fields |
 | `test_postgres_idempotent_insert` | Insert the same event (same `event_id`) twice using `ON CONFLICT DO NOTHING` | No error; only 1 row exists |
+| `test_schema_registry_reachable` | `GET http://localhost:8081/subjects` returns HTTP 200 and a JSON array | Status 200; response is a (possibly empty) list |
+| `test_schema_registry_default_compatibility` | `GET http://localhost:8081/config` reports the global compatibility level | Returns `{"compatibilityLevel": "BACKWARD"}` |
+| `test_schema_registry_backed_by_kafka` | Verify the `_schemas` topic exists on the Kafka cluster (registered by Schema Registry on first start) | Topic `_schemas` is present in cluster metadata with replication factor 3 |
 
 ### 6.3 Resource-Conscious Test Design
 
@@ -664,12 +762,13 @@ make infra-up
 # Verify all services are healthy
 make infra-status
 
-# Expected output: all 4 services (kafka-1, kafka-2, kafka-3, postgres) show "healthy"
+# Expected output: all 5 services (kafka-1, kafka-2, kafka-3, postgres, schema-registry) show "healthy"
 ```
 
-Typical startup time on WSL 2: **30–90 seconds** for all brokers to form KRaft quorum
-and pass health checks. If health checks keep showing `starting`, wait a bit longer and
-re-run `make infra-status`.
+Typical startup time on WSL 2: **45–120 seconds** — the Kafka brokers first form the
+KRaft quorum (~30–90s), and then `schema-registry` starts once the brokers are healthy
+and initializes its `_schemas` topic (adds ~15–30s). If health checks keep showing
+`starting`, wait a bit longer and re-run `make infra-status`.
 
 > **`deploy.resources` compatibility:** The `docker-compose.yml` uses the
 > `deploy.resources.limits` syntax (Compose v2 file format). Docker Desktop 4.x with
@@ -724,6 +823,12 @@ make kafka-describe
 # Open a psql shell to inspect raw_events
 make psql
 
+# List registered Schema Registry subjects
+make schema-subjects
+
+# Show default compatibility level
+make schema-compat
+
 # Tail logs for debugging
 make infra-logs
 ```
@@ -750,7 +855,8 @@ make infra-clean
 | kafka-2 | 768 MB (512 MB heap) | Docker memory limit |
 | kafka-3 | 768 MB (512 MB heap) | Docker memory limit |
 | PostgreSQL | 512 MB | Docker memory limit |
-| **Total infrastructure** | **~2.8 GB** | |
+| schema-registry | 512 MB (~256 MB heap) | Docker memory limit |
+| **Total infrastructure** | **~3.3 GB** | |
 
 This leaves ample room on a machine with 16 GB+ RAM for the OS, Docker daemon, and
 Python processes.
@@ -761,7 +867,8 @@ Python processes.
 |-----------|-----------|-------|
 | kafka-* (each) | 2.0 CPUs | Sufficient for moderate throughput |
 | PostgreSQL | 1.0 CPU | Mostly idle until sink starts |
-| **Total** | **7 CPUs** | 9 remaining for host OS + apps |
+| schema-registry | 0.5 CPU | Light REST API traffic |
+| **Total** | **7.5 CPUs** | 8.5 remaining for host OS + apps |
 
 ### 8.3 Disk Budget
 
@@ -769,8 +876,8 @@ Python processes.
   disk usage is negligible (<100 MB for cluster metadata and internal topics).
 - **PostgreSQL data:** The `raw_events` table is empty until the Kafka-to-PostgreSQL
   sink is built in a later PR.
-- **Docker images:** ~1.5 GB total (Kafka image ~800 MB, PostgreSQL image ~400 MB,
-  overhead ~300 MB).
+- **Docker images:** ~2.3 GB total (Kafka image ~800 MB, PostgreSQL image ~400 MB,
+  Schema Registry image ~800 MB, overhead ~300 MB).
 
 ### 8.4 Port Allocations
 
@@ -780,6 +887,7 @@ Python processes.
 | 19093 | kafka-2 | External Kafka client access |
 | 19094 | kafka-3 | External Kafka client access |
 | 5432 | postgres | PostgreSQL client access |
+| 8081 | schema-registry | Schema Registry HTTP REST API |
 
 ---
 
@@ -788,24 +896,53 @@ Python processes.
 These items are explicitly **out of scope** for this PR but are noted here for awareness
 as they affect decisions made in this design:
 
-1. **Kafka-to-PostgreSQL sink (later Week 1 PR):** The `raw_events` schema is designed
+1. **Avro/Protobuf schema definitions & evolution experiments (later Week 1 PR):**
+   The Schema Registry service is provisioned here, but the actual event schemas
+   (`.avsc` or `.proto` files), schema registration code, and `BACKWARD` compatibility
+   experiments (adding an optional `device_type` field, removing a deprecated field,
+   promoting `int` → `long`) are deferred to the Week 1 schema-registry PR.
+
+2. **Kafka-to-PostgreSQL sink (later Week 1 PR):** The `raw_events` schema is designed
    to support batch inserts from a sink consumer. The `event_id` UUID primary key with
    `ON CONFLICT DO NOTHING` supports idempotent writes.
 
-2. **Topic creation automation:** The `e-commerce-events` topic with 12 partitions and
+3. **Topic creation automation:** The `e-commerce-events` topic with 12 partitions and
    replication factor 3 will be created programmatically by the producer (later PR),
    not pre-created in Docker Compose. This keeps the Compose file infrastructure-only.
+   (The `_schemas` topic used by Schema Registry is the sole exception — it is
+   auto-created by Schema Registry on first start with replication factor 3.)
 
-3. **Redis (Week 2–3):** Redis will be added to the Docker Compose file in a later PR
+   **Why producer-side for this project (not production-standard):** This is a learning
+   project running on a laptop. Putting 12 partitions into the producer script is fine
+   because (a) single developer, no review process needed, (b) no operator/Terraform
+   overhead is appropriate at this scale, and (c) it teaches the `AdminClient` API,
+   which is also used in integration tests.
+
+   **Rule of thumb for production:** If more than one service reads or writes a topic,
+   or if it has non-default config (compaction, retention, RF), it should be
+   declaratively managed — not producer-created. Producer-created topics only make
+   sense for truly private, single-owner topics, and even then most organizations
+   forbid it for consistency. In production, topic definitions live in a Git repo and
+   are applied by a dedicated **"infrastructure-as-code pipeline for Kafka"** — parallel
+   to how Terraform manages AWS resources or Helm charts manage Kubernetes services.
+   This pipeline is **not** part of the application's deploy path: it has its own repo,
+   its own reviewers (platform/data-infra team), and cluster-admin credentials that the
+   application services never hold. Common implementations: Strimzi `KafkaTopic` CRDs
+   reconciled by an operator, Terraform's Kafka provider, or GitOps tools like
+   `kafka-gitops` / Julie Ops.
+
+4. **Redis (Week 2–3):** Redis will be added to the Docker Compose file in a later PR
    for online feature serving. The network and Compose structure are designed to
    accommodate additional services.
 
-4. **TLS/SASL:** Not needed for local development. If this project is ever deployed
-   beyond localhost, listeners should be reconfigured with TLS.
+5. **TLS/SASL:** Not needed for local development. If this project is ever deployed
+   beyond localhost, Kafka listeners and Schema Registry HTTP should be reconfigured
+   with TLS (and Schema Registry with Basic Auth or mTLS).
 
-5. **Monitoring (Week 5):** Prometheus JMX exporter for Kafka metrics and
-   `pg_stat_statements` for PostgreSQL can be added later. The Compose file structure
-   supports adding sidecar containers.
+6. **Monitoring (Week 5):** Prometheus JMX exporter for Kafka metrics,
+   `pg_stat_statements` for PostgreSQL, and Schema Registry's built-in JMX/HTTP
+   metrics endpoint can be added later. The Compose file structure supports adding
+   sidecar containers.
 
 ---
 
@@ -827,3 +964,10 @@ as they affect decisions made in this design:
 4. **`CLUSTER_ID` generation:** KRaft requires a pre-generated cluster ID. We will
    generate one with `kafka-storage.sh random-uuid` and hardcode it in the Compose
    file for reproducibility. This is standard practice for Docker-based Kafka setups.
+
+5. **Schema Registry image version pinning:** We pin to
+   `confluentinc/cp-schema-registry:7.8.0` because Confluent Platform 7.8.x is paired
+   with Apache Kafka 3.9.x (which matches `apache/kafka:3.9.0`). Upgrading Kafka in a
+   future PR will require bumping Schema Registry to a compatible CP release.
+   **Recommendation:** Pin both images together in lockstep to avoid client/broker
+   protocol mismatches.

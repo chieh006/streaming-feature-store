@@ -1,4 +1,4 @@
-"""Pydantic configuration models for Kafka and PostgreSQL connections."""
+"""Pydantic configuration models for Kafka, PostgreSQL, and Schema Registry."""
 
 import logging
 from pydantic import Field, SecretStr
@@ -123,3 +123,74 @@ class PostgresConfig(BaseSettings):
             f"postgresql://{self.user}:{self.password.get_secret_value()}"
             f"@{self.host}:{self.port}/{self.database}"
         )
+
+
+class SchemaRegistryConfig(BaseSettings):
+    """Configuration for connecting to Confluent Schema Registry.
+
+    Parameters
+    ----------
+    url : str
+        Base HTTP URL for the Schema Registry REST API.
+    default_compatibility : str
+        Default subject compatibility level applied when registering new
+        schemas. One of ``BACKWARD``, ``BACKWARD_TRANSITIVE``, ``FORWARD``,
+        ``FORWARD_TRANSITIVE``, ``FULL``, ``FULL_TRANSITIVE`` or ``NONE``.
+    request_timeout_s : float
+        HTTP request timeout in seconds for Schema Registry calls.
+
+    Notes
+    -----
+    This is a **client-side** config holding the connection details needed
+    to talk to the Schema Registry over HTTP. It does not configure the
+    Schema Registry server itself, nor the Kafka broker. It is shared by
+    any client that needs the registry: producers (to register/fetch
+    schemas when serializing), consumers (to fetch schemas by ID when
+    deserializing), schema-management/CI tooling (to set subject
+    compatibility or list subjects), and integration tests.
+
+    Values can be overridden via environment variables
+    prefixed with ``SCHEMA_REGISTRY_`` (e.g. ``SCHEMA_REGISTRY_URL``).
+    """
+
+    url: str = Field(
+        default="http://localhost:8081",
+        description="Base HTTP URL for the Schema Registry REST API",
+    )
+    default_compatibility: str = Field(
+        default="BACKWARD",
+        pattern=(
+            r"^(BACKWARD|BACKWARD_TRANSITIVE|FORWARD|FORWARD_TRANSITIVE"
+            r"|FULL|FULL_TRANSITIVE|NONE)$"
+        ),
+        description="Default subject compatibility level",
+    )
+    request_timeout_s: float = Field(
+        default=5.0,
+        gt=0,
+        description="HTTP request timeout in seconds",
+    )
+
+    model_config = {"env_prefix": "SCHEMA_REGISTRY_"}
+
+    @property
+    def subjects_url(self) -> str:
+        """Return the fully-qualified ``/subjects`` endpoint URL.
+
+        Returns
+        -------
+        str
+            URL for the Schema Registry ``/subjects`` endpoint.
+        """
+        return f"{self.url.rstrip('/')}/subjects"
+
+    @property
+    def config_url(self) -> str:
+        """Return the fully-qualified ``/config`` endpoint URL.
+
+        Returns
+        -------
+        str
+            URL for the Schema Registry global ``/config`` endpoint.
+        """
+        return f"{self.url.rstrip('/')}/config"

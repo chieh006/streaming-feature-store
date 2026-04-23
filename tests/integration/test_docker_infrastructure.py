@@ -10,9 +10,12 @@ Tests run sequentially (``-p no:xdist``) because the broker stop/start tests
 mutate shared state.
 """
 
+import json
 import logging
 import subprocess
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections import defaultdict
 
@@ -483,3 +486,79 @@ class TestPostgresRawEventsOperations:
                 )
                 conn.commit()
         assert count == 1, f"Expected 1 row after idempotent insert, got {count}"
+
+
+# ---------------------------------------------------------------------------
+# Schema Registry tests
+# ---------------------------------------------------------------------------
+
+
+def _http_get_json(url: str, timeout_s: float) -> tuple[int, object]:
+    """GET *url* and return ``(status_code, parsed_json_body)``.
+
+    Parameters
+    ----------
+    url : str
+        Absolute HTTP URL.
+    timeout_s : float
+        Network timeout in seconds.
+
+    Returns
+    -------
+    tuple[int, object]
+        HTTP status code and the JSON-decoded response body.
+    """
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        body = resp.read().decode("utf-8")
+        return resp.status, json.loads(body)
+
+
+class TestSchemaRegistry:
+    """Tests verifying Confluent Schema Registry is reachable and configured."""
+
+    def test_schema_registry_reachable(
+        self,
+        docker_services_up: None,
+        schema_registry_url: str,
+        schema_registry_timeout_s: float,
+    ) -> None:
+        """GET /subjects must return HTTP 200 with a JSON list body."""
+        status, body = _http_get_json(
+            f"{schema_registry_url.rstrip('/')}/subjects",
+            timeout_s=schema_registry_timeout_s,
+        )
+        assert status == 200
+        assert isinstance(body, list), f"Expected a JSON array, got {type(body).__name__}"
+
+    def test_schema_registry_default_compatibility(
+        self,
+        docker_services_up: None,
+        schema_registry_url: str,
+        schema_registry_timeout_s: float,
+    ) -> None:
+        """GET /config must report the global compatibility level as BACKWARD."""
+        status, body = _http_get_json(
+            f"{schema_registry_url.rstrip('/')}/config",
+            timeout_s=schema_registry_timeout_s,
+        )
+        assert status == 200
+        assert isinstance(body, dict)
+        assert body.get("compatibilityLevel") == "BACKWARD", (
+            f"Expected compatibilityLevel 'BACKWARD', got {body!r}"
+        )
+
+    def test_schema_registry_backed_by_kafka(self, docker_services_up: None) -> None:
+        """The ``_schemas`` topic must exist with replication factor 3."""
+        admin = _make_admin()
+        metadata = admin.list_topics(timeout=15)
+        assert "_schemas" in metadata.topics, (
+            "Schema Registry has not created the _schemas topic — "
+            "it may not have finished initialising."
+        )
+        topic_meta = metadata.topics["_schemas"]
+        for partition_id, partition in topic_meta.partitions.items():
+            assert len(partition.replicas) == 3, (
+                f"_schemas partition {partition_id} has "
+                f"{len(partition.replicas)} replicas; expected 3"
+            )
