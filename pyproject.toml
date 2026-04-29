@@ -14,16 +14,19 @@ dependencies = [
 
 [project.optional-dependencies]
 kafka = [
-    "confluent-kafka>=2.3",
+    "confluent-kafka[avro,schemaregistry]>=2.4",
+    "fastavro>=1.9",
 ]
 postgres = [
     "psycopg[binary]>=3.1",
 ]
 test = [
-    "confluent-kafka>=2.3",
+    "confluent-kafka[avro,schemaregistry]>=2.4",
+    "fastavro>=1.9",
     "psycopg[binary]>=3.1",
     "pytest>=8.0",
     "pytest-cov>=5.0",
+    "requests>=2.31",
     "sqlparse>=0.5",
 ]
 dev = [

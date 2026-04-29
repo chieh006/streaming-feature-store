@@ -1,0 +1,10 @@
+{
+  "type": "record",
+  "name": "ClickPayload",
+  "namespace": "com.featurestore.ecommerce.v1",
+  "doc": "Payload for click events: user clicked a UI element on a page.",
+  "fields": [
+    { "name": "element_id", "type": "string", "doc": "DOM element identifier that was clicked." },
+    { "name": "page_url",   "type": "string", "doc": "URL of the page where the click occurred." }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "type": "record",
+  "name": "PurchasePayload",
+  "namespace": "com.featurestore.ecommerce.v1",
+  "doc": "Payload for purchase events: user completed checkout for one or more units of a product.",
+  "fields": [
+    { "name": "product_id",  "type": "string", "doc": "Catalog identifier for the purchased product." },
+    { "name": "quantity",    "type": "int",    "doc": "Number of units purchased; must be >= 1." },
+    { "name": "price_cents", "type": "long",   "doc": "Per-unit price in minor currency units (cents)." },
+    { "name": "currency",    "type": "string", "default": "USD", "doc": "ISO 4217 three-letter currency code." }
+  ]
+}

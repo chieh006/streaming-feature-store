@@ -179,7 +179,7 @@ services:
   # metadata quorum when the topic was first written.
   # ---------------------------------------------------------------------------
   kafka-init:
-    image: confluentinc/cp-kafka:7.8.0
+    image: apache/kafka:3.9.0
     container_name: kafka-init
     networks:
       - feature-store-net
@@ -190,17 +190,35 @@ services:
         condition: service_healthy
       kafka-3:
         condition: service_healthy
-    entrypoint: ["/bin/bash", "-c"]
-    command: >
-      "until kafka-topics --bootstrap-server kafka-1:9092
-              --create --if-not-exists
-              --topic _schemas
-              --partitions 1
-              --replication-factor 3
-              --config cleanup.policy=compact; do
-         echo 'waiting for 3 brokers to be registered with the controller...';
-         sleep 2;
-       done"
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -u
+        BOOTSTRAP="kafka-1:9092,kafka-2:9092,kafka-3:9092"
+        TOPICS_CMD="/opt/kafka/bin/kafka-topics.sh"
+        OUT=/tmp/kafka-init.out
+
+        echo "[kafka-init] waiting for brokers to accept admin requests..."
+        until "$$TOPICS_CMD" --bootstrap-server "$$BOOTSTRAP" --list >"$$OUT" 2>&1; do
+          echo "[kafka-init] brokers not ready yet:"
+          sed 's/^/  /' "$$OUT"
+          sleep 2
+        done
+
+        echo "[kafka-init] creating _schemas topic (RF=3, compact)..."
+        until "$$TOPICS_CMD" --bootstrap-server "$$BOOTSTRAP" \
+                             --create --if-not-exists \
+                             --topic _schemas \
+                             --partitions 1 \
+                             --replication-factor 3 \
+                             --config cleanup.policy=compact >"$$OUT" 2>&1; do
+          echo "[kafka-init] _schemas create failed; will retry:"
+          sed 's/^/  /' "$$OUT"
+          sleep 2
+        done
+
+        echo "[kafka-init] _schemas topic ready"
     restart: "no"
 
   # ---------------------------------------------------------------------------

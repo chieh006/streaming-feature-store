@@ -3,6 +3,7 @@ COMPOSE_FILE := docker/docker-compose.yml
 .PHONY: infra-up infra-down infra-status infra-logs infra-clean \
         kafka-topics kafka-describe psql \
         schema-subjects schema-compat \
+        register-schemas register-schemas-dry produce-sample \
         test test-unit test-integration install
 
 # ---------------------------------------------------------------------------
@@ -55,6 +56,15 @@ schema-subjects:  ## List registered Schema Registry subjects
 
 schema-compat:  ## Show Schema Registry default compatibility level
 	@curl -fsS http://localhost:8081/config | jq .
+
+register-schemas:  ## Register all .avsc files under schemas/ with the Registry
+	uv run python scripts/register_schemas.py
+
+register-schemas-dry:  ## Show what would be registered without writing
+	uv run python scripts/register_schemas.py --dry-run
+
+produce-sample:  ## Send a handful of sample events end-to-end
+	uv run python -m streaming_feature_store.producer.avro_producer --sample 5
 
 # ---------------------------------------------------------------------------
 # Python / tests

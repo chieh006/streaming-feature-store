@@ -1,0 +1,10 @@
+{
+  "type": "record",
+  "name": "PageViewPayload",
+  "namespace": "com.featurestore.ecommerce.v1",
+  "doc": "Payload for page-view events: user navigated to a page.",
+  "fields": [
+    { "name": "page_url", "type": "string", "doc": "URL of the page being viewed." },
+    { "name": "referrer", "type": ["null", "string"], "default": null, "doc": "Optional HTTP referrer URL." }
+  ]
+}
