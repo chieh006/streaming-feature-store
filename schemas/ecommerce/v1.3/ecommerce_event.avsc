@@ -1,0 +1,56 @@
+{
+  "type": "record",
+  "name": "EcommerceEvent",
+  "namespace": "com.featurestore.ecommerce.v1",
+  "doc": "Envelope for all e-commerce events on the e-commerce-events topic.",
+  "fields": [
+    {
+      "name": "event_id",
+      "type": {
+        "type": "string",
+        "logicalType": "uuid"
+      },
+      "doc": "Globally-unique event identifier (UUID)."
+    },
+    {
+      "name": "event_type",
+      "type": {
+        "type": "enum",
+        "name": "EventType",
+        "symbols": [
+          "CLICK",
+          "PURCHASE",
+          "PAGE_VIEW"
+        ]
+      },
+      "doc": "Discriminator for the payload union."
+    },
+    {
+      "name": "user_id",
+      "type": "string",
+      "doc": "Stable user identifier; used as the Kafka message key."
+    },
+    {
+      "name": "session_id",
+      "type": "string",
+      "doc": "Browser/app session identifier."
+    },
+    {
+      "name": "event_timestamp",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-micros"
+      },
+      "doc": "Event time in microseconds since the Unix epoch (UTC)."
+    },
+    {
+      "name": "payload",
+      "type": [
+        "com.featurestore.ecommerce.v1.ClickPayload",
+        "com.featurestore.ecommerce.v1.PurchasePayload",
+        "com.featurestore.ecommerce.v1.PageViewPayload"
+      ],
+      "doc": "Event-type-specific payload."
+    }
+  ]
+}

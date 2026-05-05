@@ -108,8 +108,14 @@ def _resolve_schemas_dir(explicit: Path | None) -> Path:
         if not explicit.is_dir():
             raise FileNotFoundError(f"Schemas directory not found: {explicit}")
         return explicit
+    import re
+
     base = SCHEMAS_ROOT / "ecommerce"
-    candidates = sorted(p for p in base.glob("v*") if p.is_dir())
+    pattern = re.compile(r"^v\d+$")
+    candidates = sorted(
+        (p for p in base.glob("v*") if p.is_dir() and pattern.match(p.name)),
+        key=lambda p: int(p.name[1:]),
+    )
     if not candidates:
         raise FileNotFoundError(f"No versioned schema directories under {base}")
     return candidates[-1]

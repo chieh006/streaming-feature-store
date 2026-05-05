@@ -4,6 +4,8 @@ COMPOSE_FILE := docker/docker-compose.yml
         kafka-topics kafka-describe psql \
         schema-subjects schema-compat \
         register-schemas register-schemas-dry produce-sample \
+        schema-evolution schema-evolution-snapshot schema-evolution-clean \
+        schema-evolution-report \
         test test-unit test-integration install
 
 # ---------------------------------------------------------------------------
@@ -65,6 +67,26 @@ register-schemas-dry:  ## Show what would be registered without writing
 
 produce-sample:  ## Send a handful of sample events end-to-end
 	uv run python -m streaming_feature_store.producer.avro_producer --sample 5
+
+# ---------------------------------------------------------------------------
+# Schema-evolution drills (Week 1 — BACKWARD compatibility)
+# ---------------------------------------------------------------------------
+
+schema-evolution:  ## Run all 3 schema-evolution drills end-to-end (requires infra)
+	uv run python scripts/run_schema_evolution.py --drill all
+
+schema-evolution-snapshot:  ## Generate v1.x/ on disk without contacting the Registry
+	uv run python scripts/run_schema_evolution.py --drill all --snapshot-only \
+		--report-path /tmp/_schema_evolution_snapshot_only.md
+
+schema-evolution-clean:  ## Soft-delete experiment versions; keep baseline v1
+	uv run python scripts/run_schema_evolution.py --drill all \
+		--report-path /tmp/_schema_evolution_clean.md
+
+schema-evolution-report:  ## Open the generated report
+	@xdg-open docs/results/week1_schema_evolution_results.md 2>/dev/null \
+	  || open docs/results/week1_schema_evolution_results.md 2>/dev/null \
+	  || echo "Report at docs/results/week1_schema_evolution_results.md"
 
 # ---------------------------------------------------------------------------
 # Python / tests
