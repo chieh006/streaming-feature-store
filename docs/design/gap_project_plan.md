@@ -56,7 +56,7 @@
 
 ### Project Description
 
-Build a feature store system that ingests raw events via Kafka with schema evolution support, validates and transforms them in-stream, computes features in real-time, serves them at low latency for online inference, and produces versioned, reproducible training snapshots — while maintaining consistency between online (real-time) and offline (batch) feature values.
+Build a feature store system that ingests raw events via Kafka with schema evolution support, validates them in-stream (with dead-letter routing), computes features in real-time, serves them at low latency for online inference, and produces a batch-computed offline view — with an explicit consistency comparison between online (real-time) and offline (batch) feature values.
 
 ### Detailed Plan
 
@@ -76,35 +76,32 @@ Build a feature store system that ingests raw events via Kafka with schema evolu
   - **Read-side EOS:** Configure consumers with `read_committed` isolation so they only see data past the broker's Last Stable Offset (LSO), filtering out uncommitted or aborted transaction data
 - Deliverable: Running Kafka cluster with producer/consumer benchmarks, and a continuously-populating `raw_events` table in PostgreSQL
 
-**Week 2 — Validation, Transformation & Feature Computation**
+**Week 2 — Validation & Feature Computation**
 - **Validation layer:** Implement an inline validation stage in the stream processor that checks incoming events for: null/missing required fields, out-of-range values (e.g., negative prices, timestamps in the future), malformed records, and schema conformance against the registry — route invalid events to a `dead-letter-queue` topic with error metadata for debugging
-- **Transformation layer:** Apply cleaning and normalization before feature computation — e.g., standardize timestamp formats to UTC, normalize currency values, enrich events with derived fields (e.g., `is_weekend`, `hour_of_day`), and deduplicate late-arriving events using event ID + idempotent upserts
-- Implement stream processing using Kafka Streams or Flink to compute real-time features from validated, transformed events:
-  - Sliding window aggregations (clicks in last 5 minutes, purchase count in last 24 hours)
-  - Session-based features (session duration, pages per session)
-  - Entity-level running statistics (user lifetime spend, average order value)
+- Implement stream processing using Kafka Streams or Flink to compute real-time features from validated events (fold any minor enrichment, e.g. timestamp normalization, into this step rather than as a separate transformation layer):
+  - Sliding window aggregations (clicks in last 5 minutes, purchase count in last 24 hours) — the canonical streaming interview topic, invest the most time here
+  - Session-based features (session duration, pages per session) — uniquely streaming (gap timeouts, session windows); skip if time-constrained
 - Write computed features to Redis for online serving
-- Deliverable: Stream processor computing 10+ features in real-time with <100ms end-to-end latency
+- Deliverable: Stream processor computing windowed + session features in real-time with <100ms end-to-end latency
 
 **Week 3 — Online Feature Serving Layer**
-- Build a gRPC or REST API that serves features for a given entity (user ID) from Redis
+- Build a REST API (FastAPI) that serves features for a given entity (user ID) from Redis — skip gRPC here; you will build gRPC streaming in Phase 3 (LLM serving) where it actually matters
 - Implement a feature vector assembly endpoint that joins features from multiple feature groups
-- Add caching, connection pooling, and batched lookups for throughput
-- Benchmark: target <5ms p99 latency for single-entity feature vector retrieval
+- Benchmark: target <5ms p99 latency for single-entity feature vector retrieval (Redis on a laptop will hit this without explicit caching/pooling work; be ready to discuss those patterns in interviews without having implemented them)
 - Deliverable: Feature serving API with latency benchmarks
 
-**Week 4 — Offline Feature Store & Versioned Training Data Generation**
-- Build a batch pipeline that computes the same features from historical data (using DuckDB or PostgreSQL)
-- Implement point-in-time-correct joins to prevent data leakage in training sets
-- Validate online/offline consistency by comparing real-time computed features against batch-computed features
-- **Dataset versioning:** Tag each training snapshot with a version ID that captures: the data time range, the schema version used (from Schema Registry), the feature pipeline code commit hash, and a row count / checksum — store this metadata in a `dataset_versions` table in PostgreSQL so any snapshot can be reproduced exactly
-- **Reproducible snapshots:** Parameterize the batch pipeline so that running it with the same version config (time range + schema version + code hash) always produces a bit-identical Parquet output — this is what enables ML teams to debug model regressions by re-training on an exact historical dataset
-- Generate training datasets as versioned Parquet files (leveraging your existing Arrow/Parquet expertise), partitioned by date and tagged with the snapshot version
-- Deliverable: Batch pipeline with online/offline consistency report and a `dataset_versions` registry that tracks every training snapshot
+**Week 4 — Offline Feature Store & Online/Offline Consistency**
+
+The streaming-specific lesson of this week is **online/offline consistency** — when do real-time and batch values diverge, and why. That is the interview-grade story; everything else in this week supports it. Your batch background means you should keep the batch-side bullets minimal.
+
+- Build a minimal batch pipeline in DuckDB that computes the same features from the historical `raw_events` table — a single SQL query is enough; do not generalize
+- Implement the simplest possible point-in-time-correct join (one query with a timestamp filter to prevent future-info leakage) — PIT correctness is the one offline-store concept worth being able to articulate ("why naive joins leak future info"), but do not partition by date or build a reusable PIT framework
+- **Invest here:** Validate online/offline consistency by comparing real-time computed features against batch-computed features for the same entity + time window; characterize where and why they diverge (late events, window boundaries, clock skew)
+- Emit the batch result as a single Parquet file (no date partitioning, no version tagging) — dataset versioning and reproducible-snapshot machinery are batch/MLops concerns you can describe in interviews without building
+- Deliverable: One-query batch pipeline + an online/offline consistency report explaining observed divergences
 
 **Week 5 — Monitoring, Testing & Documentation**
-- Implement feature drift detection (statistical tests comparing recent vs historical feature distributions)
-- Add data freshness monitoring (alert if a feature hasn't been updated within SLA)
+- Add data freshness monitoring (alert if a feature hasn't been updated within SLA) — streaming-specific and interview-relevant; skip statistical drift detection (KS / PSI) since it's an ML-monitoring topic, not a streaming one, and shallow implementations are worse than none
 - Write integration tests that validate end-to-end correctness from event to served feature
 - Create architecture diagram and write-up explaining online/offline consistency challenges
 - Deliverable: GitHub repo with full system, monitoring dashboard, and architecture documentation
@@ -115,10 +112,10 @@ After this project, you should be able to:
 - Design a feature store that serves features at <5ms for online inference while maintaining offline consistency
 - Explain the tradeoffs between Kafka, Flink, and Kafka Streams for real-time feature computation
 - Handle schema evolution gracefully in a streaming pipeline using a schema registry with compatibility modes
-- Implement in-stream validation and transformation with dead-letter routing for malformed records
-- Produce versioned, reproducible training snapshots that capture data range, schema version, and code hash — and articulate why this matters for debugging model regressions
+- Implement in-stream validation with dead-letter routing for malformed records
 - Articulate why point-in-time correctness matters for ML training and how to implement it
-- Discuss feature drift detection and data quality monitoring for ML systems
+- Explain online/offline feature consistency: where real-time and batch values diverge and why (late events, window boundaries, clock skew)
+- Discuss data freshness monitoring for streaming feature pipelines (and articulate — without having implemented — how dataset versioning and statistical drift detection would extend the system)
 - Answer system design questions like "Design a real-time feature platform for a recommendation system" or "How do you handle schema changes in a production ML data pipeline?"
 
 ---
