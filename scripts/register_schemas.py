@@ -77,6 +77,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Show what would be registered without contacting the Registry.",
     )
     parser.add_argument(
+        "--print-schema",
+        action="store_true",
+        help="Print the full assembled schema JSON to stdout and exit.",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -182,6 +187,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         logger.info("--dry-run set: not contacting Schema Registry")
         logger.info(f"Schema preview: {schema_str[:200]}{'...' if len(schema_str) > 200 else ''}")
+        return 0
+
+    if args.print_schema:
+        import json
+        print(json.dumps(composite, indent=2))
         return 0
 
     registry = SchemaRegistry(registry_config)

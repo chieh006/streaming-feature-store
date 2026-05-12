@@ -6,6 +6,8 @@ COMPOSE_FILE := docker/docker-compose.yml
         register-schemas register-schemas-dry produce-sample \
         schema-evolution schema-evolution-snapshot schema-evolution-clean \
         schema-evolution-report \
+        topic-ensure topic-describe \
+        load-test load-test-quick load-test-report test-benchmark \
         test test-unit test-integration install
 
 # ---------------------------------------------------------------------------
@@ -65,6 +67,9 @@ register-schemas:  ## Register all .avsc files under schemas/ with the Registry
 register-schemas-dry:  ## Show what would be registered without writing
 	uv run python scripts/register_schemas.py --dry-run
 
+print-schema:  ## Print the full assembled Avro schema JSON to stdout
+	uv run python scripts/register_schemas.py --print-schema
+
 produce-sample:  ## Send a handful of sample events end-to-end
 	uv run python -m streaming_feature_store.producer.avro_producer --sample 5
 
@@ -103,3 +108,29 @@ test-integration:  ## Run integration tests (requires running infra)
 
 test:  ## Run all tests
 	uv run pytest tests/ -v --cov=streaming_feature_store --cov-report=term-missing
+
+# ---------------------------------------------------------------------------
+# Topic admin & load-test (Week 1 — synthetic event producer)
+# ---------------------------------------------------------------------------
+
+topic-ensure:  ## Idempotently create e-commerce-events (12p, RF=3)
+	uv run python -m streaming_feature_store.admin.topic_admin ensure
+
+topic-describe:  ## Print partition assignment for the configured topic
+	uv run python -m streaming_feature_store.admin.topic_admin describe
+
+load-test:  ## Run a 10s, 60K evt/s load test and write the report
+	uv run python scripts/run_event_load.py --duration-s 10 --target-rate 60000 \ 
+
+load-test-quick:  ## Smoke run: 2s, 5K evt/s, no rate floor enforcement
+	uv run python scripts/run_event_load.py --duration-s 2 --target-rate 5000 \
+	  --report-path /tmp/_load_quick.md --floor-eps 0
+
+load-test-report:  ## Open the generated report
+	@xdg-open docs/results/week1_load_test_results.md 2>/dev/null \
+	  || open docs/results/week1_load_test_results.md 2>/dev/null \
+	  || echo "Report at docs/results/week1_load_test_results.md"
+
+test-benchmark:  ## Run the 10s/50K-floor benchmark integration test explicitly
+	uv run pytest tests/integration/test_load_runner_end_to_end.py \
+	  -v -m benchmark -p no:xdist
