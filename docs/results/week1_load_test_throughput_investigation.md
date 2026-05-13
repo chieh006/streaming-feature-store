@@ -340,22 +340,162 @@ understand why with empirical confidence.
 
 ### The structural finding: GIL ceiling at ~10-15k evt/s
 
-Six different architectures — **all clustered between 9.5k and 14.5k evt/s**
-sustained throughput on this hardware (12 vCPU WSL2, 3-broker dev Kafka).
-That cluster is the empirical fingerprint of the **CPython Global Interpreter
-Lock** as the binding constraint:
+#### What we observed across every meaningful configuration
 
-- The broker can ack faster (single-broker localhost easily exceeds 50k).
-- librdkafka can saturate the network long before this rate.
-- Topic partition count, schema-cache lock, and `produce()` enqueue cost are
-  all sub-bottleneck (proven by the regressions of fixes #2 and #4).
-- What remains is **Python-side per-event work** running through the GIL,
-  serializing 12 worker threads behind a single interpreter.
+Six different architectures, each tested with its own specific hypothesis about
+where throughput should come from. Every one landed in the same narrow band:
 
-No amount of thread-tuning escapes the band. Architectures that move work
-between threads (per-worker producers, per-batch poll, dedicated pump) just
-shift *which* contention dominates without changing the total Python work
-that has to clear the GIL.
+| # | Configuration | What changed (vs. previous) | Sustained evt/s | What it should have done if NOT GIL-bound |
+|---|---|---|---|---|
+| 1 | Baseline (no tuning) | — | ~12,250 | (reference) |
+| 2 | Fix #1 (librdkafka tuning) | larger broker batches, compression, fewer broker round-trips, queue caps | **~14,500 (+18%)** | Should have unblocked I/O-bound waiting → throughput climbs as broker no longer the bottleneck. **It did, but capped at ~14.5k.** |
+| 3 | Fix #1 + Fix #2 (per-worker producers) | Removed shared schema-cache lock; gave each worker its own producer (no Python lock contention on encode path) | ~14,400 (flat -0.8%) | If Python lock contention was the constraint, removing it should have boosted throughput. **It didn't.** |
+| 4 | Fix #1 + Fix #4 (per-batch poll) | Changed polling cadence from per-event to per-1024-events (drastically reduces lock-acquire frequency) | ~9,600 (-34%) | If lock-acquire frequency was the cost, batching should have helped. **It made things worse, but the ceiling was clearly still in the 10-15k band.** |
+| 5 | Fix #1 + pump thread | Moved poll work off worker threads entirely onto a dedicated thread | ~9,800 (-32%) | If "workers needed to stop polling so they could produce more" was the model, throughput should jump. **It didn't.** |
+| 6 | Fix #1 only (revert) | Sanity check | ~14,800 | Confirms the keep config behavior. |
+
+The fact that **six independent architectures** — touching different locks,
+different topologies, different polling strategies — **all clustered in
+9.5-14.8k evt/s** is the GIL fingerprint. The architectures shifted *which
+inner constraint* was binding without ever moving the *outer* throughput
+ceiling. That's only consistent with a process-wide serialization point that
+no in-process change can escape.
+
+#### The lock stack: why each non-GIL constraint was ruled out
+
+The system has five locks layered as follows (outermost = most-encompassing,
+innermost = narrowest scope):
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          The Python process                             │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                            THE GIL                                │  │
+│  │   (one mutex; held to execute ANY Python bytecode whatsoever)     │  │
+│  │                                                                   │  │
+│  │   ┌─────────────────────────────────────────────────────────────┐ │  │
+│  │   │  AvroEventProducer (one shared instance)                    │ │  │
+│  │   │   ┌───────────────────────────────────────────────────────┐ │ │  │
+│  │   │   │  AvroSerializer                                       │ │ │  │
+│  │   │   │  - schema-cache Python lock                           │ │ │  │
+│  │   │   └───────────────────────────────────────────────────────┘ │ │  │
+│  │   │   ┌───────────────────────────────────────────────────────┐ │ │  │
+│  │   │   │  librdkafka Producer (C library)                      │ │ │  │
+│  │   │   │  - handle lock (C-side mutex)                         │ │ │  │
+│  │   │   └───────────────────────────────────────────────────────┘ │ │  │
+│  │   └─────────────────────────────────────────────────────────────┘ │  │
+│  │                                                                   │  │
+│  │   ┌─────────────────────────────────────────────────────────────┐ │  │
+│  │   │  DeliveryAccountant — internal lock                         │ │  │
+│  │   └─────────────────────────────────────────────────────────────┘ │  │
+│  │                                                                   │  │
+│  │   ┌─────────────────────────────────────────────────────────────┐ │  │
+│  │   │  TokenBucketPacer — internal lock                           │ │  │
+│  │   └─────────────────────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+For each inner lock, our experiments produced direct empirical evidence that
+it is **not** the binding constraint:
+
+| Lock | Tested by | Result | What it rules out |
+|---|---|---|---|
+| AvroSerializer schema-cache lock | Fix #2 (per-worker producers) | 0% throughput change | Removing 12-way contention on this lock didn't help → it wasn't binding. |
+| librdkafka handle lock — *acquire frequency* | Fix #4 (per-batch poll) | -34% throughput | Reducing acquire frequency 16,800× regressed throughput → frequency on this lock isn't binding. |
+| librdkafka handle lock — *contention pattern* | Fix #2 (split) and pump thread (relocate) | both regressed or flat | Worker-vs-worker contention on this lock isn't binding either. |
+| DeliveryAccountant lock | Tiny critical section (~1µs × 28k acquires/sec ≈ 28 ms/sec total) | Off the candidate list | Contention budget is < 0.3% of total worker time. |
+| TokenBucketPacer lock | Tiny + low frequency (1µs × 14 acquires/sec ≈ 14 µs/sec) | Off the candidate list | Contention budget is essentially zero. |
+
+That leaves exactly one lock the experiments did NOT escape: **the GIL**.
+
+#### Why each "failed" fix is positive evidence for the GIL hypothesis
+
+The regressions and no-ops aren't just "things that didn't work" — each one is
+a measurement that *would have falsified* the GIL hypothesis if it had moved
+throughput. None did:
+
+- **Fix #2 (per-worker producers).** Eliminated 12-way contention on the
+  schema-cache lock and the librdkafka handle lock simultaneously. If either
+  was the bottleneck, throughput should have jumped. **Result: 0% change**,
+  confirming that removing inner-lock contention doesn't free workers when
+  they're queueing on the GIL anyway.
+
+- **Fix #4 (per-batch poll).** Cut handle-lock acquire frequency by 16,800×.
+  If acquire-frequency overhead was capping throughput, batching should have
+  recovered most of that overhead. **Result: -34%**, because the
+  callback-dispatch *work* still has to happen — concentrating it on rare
+  long polls just makes the GIL contention worse, not better.
+
+- **Pump thread.** Moved all poll work onto a dedicated thread, eliminating
+  worker-vs-worker handle-lock contention from the poll path entirely. If
+  "workers waste time on poll lock contention" was the model, throughput
+  should jump. **Result: -32%**, because the pump is a new GIL contender that
+  steals interpreter time from the 12 workers.
+
+The pump-thread result is particularly damning. The pump architecture is the
+*structurally correct* fix for the symptom we identified (93% of worker time
+in `poll`). It actually does its targeted job — p50 latency dropped to 13 ms,
+the best ever measured. But **throughput went down**, not up. The only way to
+reconcile "the architecture is correct" with "throughput regressed" is that
+the work moved to a thread that competes with the workers for the GIL. If
+multiple Python threads could actually run in parallel (no GIL), the pump
+would have run on its own core and worker throughput would have climbed.
+
+Together, these three regressions form a chain that narrows the search space
+to one remaining suspect:
+
+1. Inner producer locks aren't binding (fix #2).
+2. Acquire-frequency on the librdkafka handle isn't binding (fix #4).
+3. Worker-vs-pump contention isn't the binding either — and adding a 13th
+   thread *hurt*, exactly the opposite of what non-GIL-bound code would do.
+4. **Therefore the binding constraint is the only thing none of those changes
+   could affect: the GIL.**
+
+#### Sanity check from the math
+
+At the upper end of our throughput band (~14,500 evt/s, fix #1):
+
+- Per-event Python work (Pydantic + serializer adapter + accountant updates +
+  poll callbacks) ≈ **~70 µs of GIL-held time per event**.
+- 14,500 evt/s × 70 µs = **~1,015 ms/sec** of GIL-held time.
+- One CPU core = 1,000 ms/sec of execution time.
+- We're saturating ~100% of one core's worth of Python execution.
+
+That's the ceiling. No multi-threaded design within one Python process can
+exceed roughly one core's Python execution capacity, because the GIL
+serializes Python bytecode across all threads in the process. Architectures
+that move work between threads (per-worker producers, per-batch poll,
+dedicated pump) just shift *which* contention dominates without changing the
+total Python work that has to clear the GIL.
+
+### Why multiprocessing is the next thing to try
+
+If the GIL is the binding constraint, the only way to escape it without
+changing language or interpreter is to **stop sharing the GIL across the
+threads doing the work**. The two ways to do that:
+
+1. **Multiprocessing.** Each producer process gets its own Python
+   interpreter, its own GIL, and its own ~14.5k evt/s ceiling. N processes
+   scale roughly linearly until the broker, network, or host CPU saturates.
+   Compatible with the existing code essentially as-is — wrap the load
+   harness in a `multiprocessing.Pool` and aggregate counters across
+   processes.
+
+2. **Free-threaded CPython** (3.13t / 3.14t experimental builds). Removes
+   the GIL entirely; same code runs with real multi-thread parallelism.
+   Smaller code change but uncertain compatibility — `pydantic-core`,
+   `fastavro`, and `confluent-kafka` would all need to be verified in
+   no-GIL mode.
+
+Multiprocessing is the lower-risk experiment because every dependency is
+already known to work in independent processes. We'd expect a 4-process
+deployment to land roughly at 4 × 14.5k ≈ **55-60k evt/s** — comfortably
+clearing the original 50k floor. That number plus the empirical GIL ceiling
+together explain the entire investigation: the per-process ceiling tells us
+*why* threads don't scale, and the multi-process projection tells us *what
+to build instead*.
 
 ### Recommended live config
 
