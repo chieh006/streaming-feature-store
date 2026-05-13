@@ -67,6 +67,91 @@ class KafkaConfig(BaseSettings):
         return [s.strip() for s in self.bootstrap_servers.split(",")]
 
 
+class ProducerTuning(BaseSettings):
+    """Throughput-oriented librdkafka knobs for :class:`SerializingProducer`.
+
+    Parameters
+    ----------
+    linger_ms : int
+        ``linger.ms`` — wait this many ms before sending a batch so it has a
+        chance to fill. Higher values trade latency for batch size / throughput.
+    compression_type : str
+        ``compression.type`` — one of ``none``, ``gzip``, ``snappy``, ``lz4``,
+        ``zstd``. ``lz4`` gives 3-5× wire-payload reduction on Avro at near-zero
+        CPU cost.
+    queue_buffering_max_messages : int
+        ``queue.buffering.max.messages`` — hard ceiling on in-flight messages
+        in the producer's local queue. Default 100k is the cause of
+        ``BufferError`` retries when ``max_in_flight`` is large.
+    queue_buffering_max_kbytes : int
+        ``queue.buffering.max.kbytes`` — hard ceiling on local queue bytes.
+    acks : str
+        ``acks`` — ``0``, ``1``, or ``all``. ``1`` skips replication round-trip
+        and is **load-test / dev only**, NOT safe for production.
+    batch_size : int
+        ``batch.size`` — max bytes per physical batch sent to the broker.
+        ``2_000_000`` allows ~2 MB batches; default librdkafka is 1 MB.
+
+    Notes
+    -----
+    Field names use Python underscores; the mapping to librdkafka dotted keys
+    happens in :meth:`as_librdkafka_conf`.
+
+    Values can be overridden via environment variables prefixed with
+    ``KAFKA_PRODUCER_`` (e.g. ``KAFKA_PRODUCER_LINGER_MS=50``).
+
+    Defaults are tuned for the Week 1 load-test scenario (12 worker threads,
+    ``max_in_flight=50_000``, single-broker dev cluster).
+    """
+
+    linger_ms: int = Field(default=20, ge=0, description="librdkafka linger.ms")
+    compression_type: str = Field(
+        default="lz4",
+        pattern=r"^(none|gzip|snappy|lz4|zstd)$",
+        description="librdkafka compression.type",
+    )
+    queue_buffering_max_messages: int = Field(
+        default=1_000_000,
+        ge=1,
+        description="librdkafka queue.buffering.max.messages",
+    )
+    queue_buffering_max_kbytes: int = Field(
+        default=1_048_576,
+        ge=1,
+        description="librdkafka queue.buffering.max.kbytes (1 GiB default)",
+    )
+    acks: str = Field(
+        default="1",
+        pattern=r"^(0|1|all)$",
+        description="librdkafka acks (load-test default '1' — NOT for production)",
+    )
+    batch_size: int = Field(
+        default=2_000_000,
+        ge=1,
+        description="librdkafka batch.size in bytes",
+    )
+
+    model_config = {"env_prefix": "KAFKA_PRODUCER_"}
+
+    def as_librdkafka_conf(self) -> dict[str, object]:
+        """Return the tuning fields as a librdkafka-keyed dict.
+
+        Returns
+        -------
+        dict[str, object]
+            Mapping suitable for merging into the
+            :class:`SerializingProducer` config dict.
+        """
+        return {
+            "linger.ms": self.linger_ms,
+            "compression.type": self.compression_type,
+            "queue.buffering.max.messages": self.queue_buffering_max_messages,
+            "queue.buffering.max.kbytes": self.queue_buffering_max_kbytes,
+            "acks": self.acks,
+            "batch.size": self.batch_size,
+        }
+
+
 class PostgresConfig(BaseSettings):
     """Configuration for connecting to PostgreSQL.
 

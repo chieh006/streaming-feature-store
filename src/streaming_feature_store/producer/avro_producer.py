@@ -24,7 +24,11 @@ from confluent_kafka import KafkaError, Message, SerializingProducer
 from confluent_kafka.schema_registry.avro import AvroSerializer
 from confluent_kafka.serialization import StringSerializer
 
-from streaming_feature_store.config import KafkaConfig, SchemaRegistryConfig
+from streaming_feature_store.config import (
+    KafkaConfig,
+    ProducerTuning,
+    SchemaRegistryConfig,
+)
 from streaming_feature_store.schemas import (
     EcommerceEvent,
     SchemaRegistry,
@@ -53,6 +57,11 @@ class AvroEventProducer:
     schema_version_dir : str, optional
         Subpath under ``schemas/`` containing the ``.avsc`` files to bind to
         the serializer.  Defaults to ``ecommerce/v1``.
+    tuning : ProducerTuning, optional
+        Throughput-oriented librdkafka knobs (``linger.ms``,
+        ``compression.type``, queue caps, ``acks``, ``batch.size``).
+        Defaults to :class:`ProducerTuning` defaults, which are tuned for the
+        Week 1 load-test (``acks=1`` — load-test only, NOT production).
 
     Notes
     -----
@@ -71,11 +80,13 @@ class AvroEventProducer:
         registry_config: SchemaRegistryConfig,
         topic: str | None = None,
         schema_version_dir: str = DEFAULT_SCHEMA_VERSION_DIR,
+        tuning: ProducerTuning | None = None,
     ) -> None:
         self._kafka_config = kafka_config
         self._registry_config = registry_config
         self._topic = topic or kafka_config.topic
         self._schema_dir = SCHEMAS_ROOT / schema_version_dir
+        self._tuning = tuning if tuning is not None else ProducerTuning()
         self._registry = SchemaRegistry(registry_config)
         self._schema_str = dump_schema(load_schema_set(self._schema_dir))
         self._serializer = self._build_serializer()
@@ -132,14 +143,14 @@ class AvroEventProducer:
             Kafka producer with string key serialization and Avro value
             serialization.
         """
-        return SerializingProducer(
-            {
-                "bootstrap.servers": self._kafka_config.bootstrap_servers,
-                "security.protocol": self._kafka_config.security_protocol,
-                "key.serializer": StringSerializer("utf_8"),
-                "value.serializer": self._serializer,
-            }
-        )
+        conf: dict[str, object] = {
+            "bootstrap.servers": self._kafka_config.bootstrap_servers,
+            "security.protocol": self._kafka_config.security_protocol,
+            "key.serializer": StringSerializer("utf_8"),
+            "value.serializer": self._serializer,
+        }
+        conf.update(self._tuning.as_librdkafka_conf())
+        return SerializingProducer(conf)
 
     @staticmethod
     def _delivery_report(err: KafkaError | None, msg: Message | None) -> None:

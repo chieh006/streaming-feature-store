@@ -10,7 +10,11 @@ from uuid import uuid4
 
 import pytest
 
-from streaming_feature_store.config import KafkaConfig, SchemaRegistryConfig
+from streaming_feature_store.config import (
+    KafkaConfig,
+    ProducerTuning,
+    SchemaRegistryConfig,
+)
 from streaming_feature_store.producer.avro_producer import (
     AvroEventProducer,
     _build_sample_event,
@@ -263,6 +267,68 @@ def test_flush_delegates_to_underlying(
     patched_clients["producer_instance"].flush.return_value = 0
     assert producer.flush(timeout_s=2.5) == 0
     patched_clients["producer_instance"].flush.assert_called_with(2.5)
+
+
+def test_producer_applies_default_tuning(
+    patched_clients: dict, producer: AvroEventProducer
+) -> None:
+    """Default ``ProducerTuning`` knobs must be merged into producer conf."""
+    conf = patched_clients["producer_cls"].call_args.args[0]
+    assert conf["linger.ms"] == 20
+    assert conf["compression.type"] == "lz4"
+    assert conf["queue.buffering.max.messages"] == 1_000_000
+    assert conf["queue.buffering.max.kbytes"] == 1_048_576
+    assert conf["acks"] == "1"
+    assert conf["batch.size"] == 2_000_000
+
+
+def test_producer_accepts_custom_tuning(
+    patched_clients: dict,
+    kafka_config: KafkaConfig,
+    registry_config: SchemaRegistryConfig,
+) -> None:
+    """A caller-supplied ``ProducerTuning`` overrides the defaults."""
+    tuning = ProducerTuning(
+        linger_ms=5,
+        compression_type="zstd",
+        queue_buffering_max_messages=200_000,
+        queue_buffering_max_kbytes=524_288,
+        acks="all",
+        batch_size=131_072,
+    )
+    AvroEventProducer(kafka_config, registry_config, tuning=tuning)
+    conf = patched_clients["producer_cls"].call_args.args[0]
+    assert conf["linger.ms"] == 5
+    assert conf["compression.type"] == "zstd"
+    assert conf["queue.buffering.max.messages"] == 200_000
+    assert conf["queue.buffering.max.kbytes"] == 524_288
+    assert conf["acks"] == "all"
+    assert conf["batch.size"] == 131_072
+
+
+def test_producer_tuning_rejects_invalid_compression() -> None:
+    """Pydantic validation must reject unknown compression codecs."""
+    with pytest.raises(ValueError):
+        ProducerTuning(compression_type="brotli")
+
+
+def test_producer_tuning_rejects_invalid_acks() -> None:
+    """Pydantic validation must reject unknown acks values."""
+    with pytest.raises(ValueError):
+        ProducerTuning(acks="2")
+
+
+def test_producer_tuning_as_librdkafka_conf_keys() -> None:
+    """``as_librdkafka_conf`` must emit librdkafka-style dotted keys."""
+    keys = ProducerTuning().as_librdkafka_conf().keys()
+    assert {
+        "linger.ms",
+        "compression.type",
+        "queue.buffering.max.messages",
+        "queue.buffering.max.kbytes",
+        "acks",
+        "batch.size",
+    } == set(keys)
 
 
 def test_purchase_event_routes_through_to_dict_adapter() -> None:
