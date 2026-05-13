@@ -21,6 +21,8 @@ for the latest run's full report.
 | 5 | 2026-05-13 | baseline (no tuning, warm) | 12,049 | 125,952 | 125,952 | 0 | 15.8 | 355.5 | 624.4 | 10.45 | ❌ FAILED | warm baseline (post WSL, broker stabilized); matches run #2 profile |
 | 6 | 2026-05-13 | fix #1 (linger.ms=20, lz4, queue caps, acks=1, batch.size=2M) | 14,619 | 151,552 | 151,552 | 0 | 27.7 | 170.1 | 297.7 | 10.37 | ❌ FAILED | first run with fix #1, warm; +21% throughput vs run #5, p95 / p99 roughly halved |
 | 7 | 2026-05-13 | fix #1 (same as run #6) | 14,364 | 148,480 | 148,480 | 0 | 29.1 | 169.1 | 242.1 | 10.34 | ❌ FAILED | fix #1 confirm run, warm; reproduces run #6 within ~2% across all metrics |
+| 8 | 2026-05-13 | fix #1 + fix #2 (one producer per worker) | 14,006 | 146,432 | 146,432 | 0 | 172.7 | 421.1 | 521.2 | 10.46 | ❌ FAILED | first run with fix #2, warm; throughput ~flat vs fix #1, p50 / p95 / p99 all ~2-6× WORSE — likely smaller broker batches (12 producers split the same data → 12× more, smaller produce requests) |
+| 9 | 2026-05-13 | fix #1 + fix #2 (same as run #8) | 14,755 | 153,600 | 153,600 | 0 | 180.2 | 405.9 | 487.8 | 10.41 | ❌ FAILED | fix #2 confirm run, warm; reproduces run #8 pattern — throughput flat (~14.4k median), latency 2-6× worse than fix #1 alone. Lock contention was NOT the binding constraint; revert fix #2 |
 
 Key observations (run #0):
 
@@ -89,6 +91,103 @@ the most plausible remaining bottleneck.
 except p99 (-19%, expected variance for a single-message tail percentile).
 The result is solid.
 
+### Fix #2 — one `AvroEventProducer` per worker thread (applied 2026-05-13, REVERTED)
+
+**Change applied:** in
+[load_runner.py](../../src/streaming_feature_store/load/load_runner.py)
+`run()`, each worker now constructs its own `AvroEventProducer` (mirroring the
+existing per-worker generator pattern) instead of sharing a single instance.
+Each producer is flushed independently after threads join. The change is
+applied on top of fix #1.
+
+**Compared against:** fix #1 (warm) median of runs #6 and #7.
+
+| Metric | Fix #1 (warm, #6 + #7) | Fix #1 + Fix #2 (warm, #8 + #9) | Δ |
+|---|---|---|---|
+| Sustained evt/s | 14,492 (median) | 14,381 (median) | -0.8% (flat) |
+| p50 ack ms | ~28 | ~176 | **+528%** |
+| p95 ack ms | ~170 | ~413 | **+143%** |
+| p99 ack ms | ~270 | ~504 | **+87%** |
+| In-flight (Little's Law) | ~405 | ~2,540 | **6× more queued** |
+| Failed | 0 | 0 | unchanged |
+| Wallclock s | ~10.4 | ~10.4 | unchanged |
+
+**Verdict: REGRESSION — revert.** Throughput stayed flat while every latency
+percentile got dramatically worse. Lock contention on the shared
+`AvroSerializer` was **not** the binding constraint — the doc's
+prediction in §2 of "Potential fixes" was wrong.
+
+**Why it regressed (root cause):**
+
+The shared producer naturally pooled all 12 workers' events into one fat
+batch every `linger.ms=20` window:
+
+- Shared (fix #1): 14,492 evt/s × 0.020 s = **~290 events / batch ≈ 145 KB**
+  → broker sees ~50 produce requests / sec.
+- Per-worker (fix #2): 14,381 / 12 producers = 1,198 evt/s × 0.020 s
+  = **~24 events / batch ≈ 12 KB** → broker sees ~600 produce requests / sec.
+
+Splitting the data stream into 12 independent producers fragmented broker
+batches by ~12×. The broker's per-request fixed cost (parse + log append +
+ack frame + replication coordination) is roughly 1-3 ms regardless of batch
+size; with 12× more requests, that overhead now dominates per-event latency.
+Schema-cache lock contention was a tiny saving compared to that new cost.
+
+**Secondary contributors:**
+
+- **12× librdkafka background sender threads** competing for CPU on a
+  WSL host with limited vCPUs.
+- **12× TCP connections per broker** (12 producers × 3 brokers = 36 sockets
+  vs 3 in the shared case).
+- **12× producer-buffer reservations** — pre-allocated librdkafka memory
+  scales with producer count.
+
+**What this empirically proves about the per-event critical path:**
+
+The Amdahl bound from fix #1 was already telling us the lock could be at
+most ~17% of per-event time. Fix #2's regression confirms a tighter bound:
+the lock was **negligible** (probably 1-5%), because removing it entirely
+gave **zero** throughput gain — even before accounting for the offsetting
+broker-side cost. If the lock had been the binding constraint, we would
+have seen *some* throughput improvement; we saw none.
+
+**The "not thread-safe" docstring was a correctness statement, not a
+performance one.** `AvroSerializer.__call__`'s lock-protected critical
+section is a microsecond-scale dict lookup; even with 12 threads in the
+queue, the per-event share is tiny. The docstring is good library hygiene
+to honor in general, but does not imply the lock is hot in any specific
+workload — that requires measurement.
+
+**Methodological lesson — measure before optimizing:**
+
+Fix #2 was applied on the strength of a plausible-sounding hypothesis
+(*"shared lock → contention → bottleneck"*) without first profiling the
+per-event path to verify the lock was actually a meaningful share of CPU
+time. A 5-minute `py-spy --idle` run on a worker thread under fix #1
+would have shown the lock at 1-5% of total time and saved this regression.
+**Profile first, optimize second** — applies to every future fix in this
+investigation.
+
+**Reproducibility:** runs #8 and #9 reproduce within ~5% on all metrics.
+The regression is real and stable, not a transient.
+
+**Action:** revert fix #2 in code; the live config is fix #1 (single shared
+producer, librdkafka tuned). Update §2 of "Potential fixes" below to record
+the empirical disproof of its premise.
+
+### Profile (under fix #1, captured 2026-05-13)
+
+A `py-spy --idle` flame graph of the worker threads under fix #1
+([artifact](week1_load_profile.svg),
+[full analysis](week1_load_profile_analysis.md)) shows **`producer.poll(0)`
+accounts for ~93% of per-worker wall time.** Avro encoding, Pydantic-to-dict,
+and the schema-cache lock together total < 5%.
+
+This **vindicates fix #4 as the binding constraint** (re-prioritize from
+"small-to-medium gain" to "large gain") and **conclusively confirms fix #2's
+post-mortem** (lock contributed 0 detectable samples). Profile-grounded
+priority for next work: apply fix #4.
+
 ## Hypothesis
 
 The producer pipeline cannot keep up with what 12 worker threads generate, so
@@ -120,7 +219,12 @@ test to attribute improvement.
 **Expected gain:** large. Should eliminate `BufferError` stalls entirely and
 ship messages in much fuller batches.
 
-### 2. One `AvroEventProducer` per worker thread
+### 2. One `AvroEventProducer` per worker thread — TRIED, REVERTED
+
+> **Empirical result (runs #8 + #9):** regression. Throughput flat, latency
+> 2-6× worse. See [Findings → Fix #2](#fix-2--one-avroeventproducer-per-worker-thread-applied-2026-05-13-reverted)
+> for the full diagnosis. The premise below ("schema-cache lock = dominant
+> bottleneck") was empirically disproved.
 
 **Where:** [load_runner.py:95-97](../../src/streaming_feature_store/load/load_runner.py#L95-L97)
 
@@ -137,7 +241,23 @@ queueing is fixed.
 **Expected gain:** medium-to-large, especially after fix #1 removes queue
 saturation as the binding constraint.
 
-### 3. Verify the topic has ≥ 12 partitions
+### 3. Verify the topic has ≥ 12 partitions — CHECKED, already optimal
+
+> **Empirical result (2026-05-13):** `topic_admin describe` reports
+> `partitions=12, RF=3` with leadership evenly balanced (4 partitions per
+> broker). Each of the 12 workers can land on a distinct leader. Partition
+> count is **not** the bottleneck.
+>
+> ```
+> e-commerce-events: partitions=12 RF=3
+>   kafka-1 leads {0, 5, 6, 9}
+>   kafka-2 leads {1, 4, 7, 11}
+>   kafka-3 leads {2, 3, 8, 10}
+> ```
+>
+> No code change required. Fix #3 strikes off as a no-op verification.
+
+
 
 **Where:** topic creation; use the new
 [topic_admin module](../../src/streaming_feature_store/admin/) to inspect

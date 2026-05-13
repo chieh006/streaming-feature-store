@@ -62,3 +62,8 @@ src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP"]
+
+[dependency-groups]
+dev = [
+    "py-spy>=0.4.2",
+]
