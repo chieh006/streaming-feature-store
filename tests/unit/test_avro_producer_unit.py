@@ -257,8 +257,29 @@ def test_produce_polls_underlying_producer(
     producer: AvroEventProducer,
     click_event: EcommerceEvent,
 ) -> None:
+    """``produce()`` calls ``poll(0)`` after enqueue to dispatch any pending
+    delivery callbacks (keeps the callback pump moving)."""
     producer.produce(click_event)
     patched_clients["producer_instance"].poll.assert_called_with(0)
+
+
+def test_poll_delegates_to_underlying_producer(
+    patched_clients: dict, producer: AvroEventProducer
+) -> None:
+    """Fix #4: the public ``poll`` method delegates to the underlying
+    librdkafka producer's ``poll``."""
+    patched_clients["producer_instance"].poll.return_value = 3
+    served = producer.poll(0.5)
+    assert served == 3
+    patched_clients["producer_instance"].poll.assert_called_once_with(0.5)
+
+
+def test_poll_default_timeout_is_zero(
+    patched_clients: dict, producer: AvroEventProducer
+) -> None:
+    """``poll()`` with no arg defaults to non-blocking ``timeout_s=0.0``."""
+    producer.poll()
+    patched_clients["producer_instance"].poll.assert_called_once_with(0.0)
 
 
 def test_flush_delegates_to_underlying(

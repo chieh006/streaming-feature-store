@@ -209,6 +209,22 @@ class AvroEventProducer:
         )
         self._producer.poll(0)
 
+    def poll(self, timeout_s: float = 0.0) -> int:
+        """Drive the delivery-callback pump.
+
+        Parameters
+        ----------
+        timeout_s : float, optional
+            Maximum seconds to block waiting for events.  ``0.0`` (default)
+            polls non-blockingly and dispatches any ready callbacks.
+
+        Returns
+        -------
+        int
+            Number of events served (delivery callbacks dispatched).
+        """
+        return self._producer.poll(timeout_s)
+
     def flush(self, timeout_s: float = 10.0) -> int:
         """Block until all queued messages are delivered or *timeout_s* elapses.
 

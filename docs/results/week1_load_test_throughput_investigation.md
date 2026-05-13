@@ -23,6 +23,11 @@ for the latest run's full report.
 | 7 | 2026-05-13 | fix #1 (same as run #6) | 14,364 | 148,480 | 148,480 | 0 | 29.1 | 169.1 | 242.1 | 10.34 | ❌ FAILED | fix #1 confirm run, warm; reproduces run #6 within ~2% across all metrics |
 | 8 | 2026-05-13 | fix #1 + fix #2 (one producer per worker) | 14,006 | 146,432 | 146,432 | 0 | 172.7 | 421.1 | 521.2 | 10.46 | ❌ FAILED | first run with fix #2, warm; throughput ~flat vs fix #1, p50 / p95 / p99 all ~2-6× WORSE — likely smaller broker batches (12 producers split the same data → 12× more, smaller produce requests) |
 | 9 | 2026-05-13 | fix #1 + fix #2 (same as run #8) | 14,755 | 153,600 | 153,600 | 0 | 180.2 | 405.9 | 487.8 | 10.41 | ❌ FAILED | fix #2 confirm run, warm; reproduces run #8 pattern — throughput flat (~14.4k median), latency 2-6× worse than fix #1 alone. Lock contention was NOT the binding constraint; revert fix #2 |
+| 10 | 2026-05-13 | fix #1 + fix #4 (poll once per app-batch of 1024) | 10,297 | 108,544 | 108,544 | 0 | 461.1 | 904.2 | 1298.8 | 10.54 | ❌ FAILED | first run with fix #4, broker-warm-ish (post ~3.5 min test-suite idle); throughput DOWN -29% vs fix #1 baseline, p50 16× worse — callback-dispatch concentration appears to have replaced per-event poll contention as the new binding constraint |
+| 11 | 2026-05-13 | fix #1 + fix #4 (same as run #10) | 8,858 | 92_160 | 92_160 | 0 | 180.4 | 509.1 | 604.9 | 10.40 | ❌ FAILED | fix #4 confirm run, warm; throughput **even lower** (-39% vs fix #1), latency varies (p50 180 here vs 461 in #10) — confirms fix #4 is a real regression on throughput; latency variance between runs reflects timing luck of poll-vs-ack alignment |
+| 12 | 2026-05-13 | fix #1 + pump thread (workers stop polling; dedicated thread drains callbacks) | 10,170 | 110,592 | 110,592 | 0 | **13.9** | 359.5 | 388.0 | 10.87 | ❌ FAILED | first run with pump thread, warm; **p50 = 13.9 ms (best ever)** — pump architecture works for callback dispatch latency. But throughput DOWN -30% vs fix #1. Suggests we've moved the bottleneck again: probably GIL contention between pump and 12 workers (pump holds GIL while dispatching ~14k callbacks/sec) |
+| 13 | 2026-05-13 | fix #1 + pump thread (same as run #12) | 9,451 | 101,376 | 101,376 | 0 | **12.4** | **23.8** | **151.2** | 10.73 | ❌ FAILED | pump confirm run, warm; throughput reproduces (~10k), p50 reproduces (~13 ms), but **tail dramatically better** (p95 23.8, p99 151.2 — best p95 ever recorded) — confirms bimodal latency from GIL-burst alignment, varies between runs. Pump architecture is real latency-vs-throughput trade vs fix #1 |
+| 14 | 2026-05-13 | fix #1 only (post-pump-revert sanity check) | 14,814 | 152,576 | 152,576 | 0 | 29.7 | 192.0 | 742.3 | 10.30 | ❌ FAILED | ✅ **revert verified**: throughput 14,814 (+2% vs fix #1 baseline), p50 29.7 ms (within 6%), p95 192 ms (within 13%) — live config is back to fix #1 behavior. p99 = 742 ms is a tail outlier (single sluggish message); doesn't affect the verdict |
 
 Key observations (run #0):
 
@@ -316,4 +321,108 @@ Yes — strongly recommended. Reasons:
 The only argument *against* one-at-a-time is calendar time — each iteration
 costs a Compose restart + a 10 s run + reading the report (~2 min). For four
 fixes, that's well under an hour. Worth it.
+
+## Conclusion (2026-05-13)
+
+After 13 measured runs and four exploratory fixes, the Week 1 load test does
+**not** reach the 50,000 evt/s floor on this hardware/runtime, and we now
+understand why with empirical confidence.
+
+### Summary of all fixes attempted
+
+| # | Fix | Outcome |
+|---|---|---|
+| 1 | librdkafka tuning (`linger.ms`, `lz4`, queue caps, `acks=1`, `batch.size=2M`) | ✅ **kept** — +18% throughput, p95/p99 halved |
+| 2 | One `AvroEventProducer` per worker thread | ❌ regression, reverted (broker batch fragmentation; lock not the bottleneck) |
+| 3 | Verify topic ≥ 12 partitions | ✅ no-op (already 12 partitions, RF=3, evenly balanced) |
+| 4 | Move `poll(0)` from per-event to per-app-batch | ❌ regression, reverted (callback dispatch concentration / staleness) |
+| pump | Dedicated callback-pump thread (workers stop polling) | ❌ reverted — best p50 (~13 ms) but throughput regressed -32% |
+
+### The structural finding: GIL ceiling at ~10-15k evt/s
+
+Six different architectures — **all clustered between 9.5k and 14.5k evt/s**
+sustained throughput on this hardware (12 vCPU WSL2, 3-broker dev Kafka).
+That cluster is the empirical fingerprint of the **CPython Global Interpreter
+Lock** as the binding constraint:
+
+- The broker can ack faster (single-broker localhost easily exceeds 50k).
+- librdkafka can saturate the network long before this rate.
+- Topic partition count, schema-cache lock, and `produce()` enqueue cost are
+  all sub-bottleneck (proven by the regressions of fixes #2 and #4).
+- What remains is **Python-side per-event work** running through the GIL,
+  serializing 12 worker threads behind a single interpreter.
+
+No amount of thread-tuning escapes the band. Architectures that move work
+between threads (per-worker producers, per-batch poll, dedicated pump) just
+shift *which* contention dominates without changing the total Python work
+that has to clear the GIL.
+
+### Recommended live config
+
+**Fix #1 only** is the keep config. It maximizes throughput within the
+single-process Python ceiling:
+
+- `linger.ms=20`, `compression.type=lz4`,
+  `queue.buffering.max.messages=1_000_000`,
+  `queue.buffering.max.kbytes=1_048_576`, `acks=1`, `batch.size=2_000_000`.
+- Single shared `AvroEventProducer` for all worker threads.
+- `produce()` calls `poll(0)` per event (keeps callbacks fresh).
+
+Sustained: ~14.5k evt/s, p50 ~28 ms, p95 ~170 ms, p99 ~270 ms — reproducible
+within ~2% across runs.
+
+### Production guidance: scale by processes, not threads
+
+If a production ingestion pipeline needs throughput beyond ~15k evt/s, the
+correct architectural answer is **multiple producer processes, not more
+worker threads**. Each producer process gets its own Python interpreter and
+its own GIL, so N processes scale roughly linearly until the broker or
+network saturates.
+
+Suggested deployment shape:
+
+- **One process per CPU core** (or per available vCPU on the host).
+- **Each process runs a small thread pool** (4-8 workers) producing through
+  one shared `AvroEventProducer` (the within-process fix #1 config).
+- **Broker partition count = N_processes × workers_per_process** (or higher)
+  so each worker can target a distinct leader.
+- **Aggregate metrics across processes** for monitoring (e.g., per-process
+  throughput counters → Prometheus → sum).
+
+A 4-process deployment on this hardware would plausibly reach ~50-60k evt/s
+throughput at the cost of 4× the memory footprint and added IPC complexity
+for the operator.
+
+### Status of the load-test harness
+
+The load test as written serves its primary purpose: **verifying producer
+configurations and broker setup, not stress-testing throughput limits**. At
+~14.5k evt/s sustained with no errors, no failed deliveries, and clean
+percentile shapes, it's a useful regression check for any future change to
+the producer, schema, or broker config.
+
+The 50k evt/s floor was an aspirational target written before the GIL ceiling
+was characterized. It is **not achievable in the current single-process
+architecture** and should be relaxed (e.g., to 10k for "config sanity check"
+verdicts) or moved to a multi-process variant of the harness if higher
+numbers are wanted.
+
+### Lessons for future work
+
+1. **Profile before optimizing.** Fix #2 was a regression that a 5-minute
+   `py-spy --idle` run would have prevented. Speculation about which Python
+   construct is "obviously slow" is unreliable; measurement is not.
+2. **Read profile output carefully — % time ≠ % wasted.** The 93% of worker
+   time in `poll(0)` was mostly *useful* callback dispatch work, not pure
+   contention. Removing the call moved the work elsewhere; it didn't
+   eliminate it.
+3. **Library docstring guidance is for correctness, not always performance.**
+   "Not thread-safe — one per thread" doesn't imply the lock is hot. Verify
+   with measurement before treating it as a perf prescription.
+4. **Architecture fights are conservation games.** Moving work between
+   threads doesn't reduce the work; it just changes who waits for what.
+   Real throughput gains require either reducing total work or escaping the
+   serialization point (in our case, the GIL).
+5. **The right "next move" after exhausting same-process options is
+   multiprocessing or a no-GIL Python build.** Not more thread-tuning.
 

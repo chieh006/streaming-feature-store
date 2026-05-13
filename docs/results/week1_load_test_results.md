@@ -1,6 +1,6 @@
 # Week 1 — Synthetic Event Load Test Results
 
-**Generated:** 2026-05-13T05:57:59.955547+00:00
+**Generated:** 2026-05-13T08:09:49.249381+00:00
 **Topic:** e-commerce-events
 
 ## Configuration
@@ -18,14 +18,14 @@
 
 | Metric | Value |
 |---|---|
-| Produced | 153_600 |
-| Acked | 153_600 |
+| Produced | 152_576 |
+| Acked | 152_576 |
 | Failed | 0 |
-| Sustained rate | 14,755 evt/s ❌ (floor 50_000) |
-| Ack latency p50 / p95 / p99 | 180.2 / 405.9 / 487.8 ms |
+| Sustained rate | 14,814 evt/s ❌ (floor 50_000) |
+| Ack latency p50 / p95 / p99 | 29.7 / 192.0 / 742.3 ms |
 | Errors by class | {} |
-| Wallclock | 10.41 s |
+| Wallclock | 10.30 s |
 
 ## Verdict
 
-❌ FAILED: sustained 14,755 evt/s vs floor 50_000 evt/s.
+❌ FAILED: sustained 14,814 evt/s vs floor 50_000 evt/s.
