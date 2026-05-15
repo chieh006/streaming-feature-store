@@ -8,6 +8,7 @@ COMPOSE_FILE := docker/docker-compose.yml
         schema-evolution-report \
         topic-ensure topic-describe \
         load-test load-test-quick load-test-report test-benchmark \
+        load-test-mp load-test-mp-quick load-test-mp-report \
         test test-unit test-integration install
 
 # ---------------------------------------------------------------------------
@@ -134,3 +135,20 @@ load-test-report:  ## Open the generated report
 test-benchmark:  ## Run the 10s/50K-floor benchmark integration test explicitly
 	uv run pytest tests/integration/test_load_runner_end_to_end.py \
 	  -v -m benchmark -p no:xdist
+
+# ---------------------------------------------------------------------------
+# Multi-process load test (Week 1 — GIL-escape harness)
+# ---------------------------------------------------------------------------
+
+load-test-mp:  ## Run a 10s, 60K evt/s multi-process load test and write the report
+	uv run python scripts/run_event_load_mp.py --duration-s 10 --target-rate 60000
+
+load-test-mp-quick:  ## Smoke run: 2s, 5K evt/s aggregate, 2 processes, no floor
+	uv run python scripts/run_event_load_mp.py --duration-s 2 --target-rate 5000 \
+	  --processes 2 --workers-per-process 2 \
+	  --report-path /tmp/_load_mp_quick.md --floor-eps 0
+
+load-test-mp-report:  ## Open the multi-process report
+	@xdg-open docs/results/week1_load_test_results_mp.md 2>/dev/null \
+	  || open docs/results/week1_load_test_results_mp.md 2>/dev/null \
+	  || echo "Report at docs/results/week1_load_test_results_mp.md"

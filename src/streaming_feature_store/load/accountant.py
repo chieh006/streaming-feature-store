@@ -219,6 +219,19 @@ class DeliveryAccountant:
             return 0.0
         return float(np.percentile(np.asarray(samples, dtype=np.float64), q) * 1000.0)
 
+    def latency_samples_s(self) -> list[float]:
+        """Return a copy of the reservoir samples (seconds).
+
+        Returns
+        -------
+        list of float
+            Raw reservoir samples in seconds.  Used by the multi-process
+            aggregator to re-percentile the union of per-process reservoirs;
+            within a single process :meth:`snapshot` is the normal accessor.
+        """
+        with self._lock:
+            return list(self._reservoir)
+
     def snapshot(self) -> AccountantSnapshot:
         """Return an immutable :class:`AccountantSnapshot`.
 

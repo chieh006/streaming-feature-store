@@ -87,6 +87,24 @@ def test_latency_percentiles_monotonic():
     assert snap.ack_latency_p50_ms <= snap.ack_latency_p95_ms <= snap.ack_latency_p99_ms
 
 
+def test_latency_samples_s_returns_copy_of_reservoir():
+    """``latency_samples_s`` returns a snapshot copy that does not alias state."""
+    a = DeliveryAccountant(reservoir_size=4)
+    for _ in range(3):
+        a.record_produced()
+        a.record(None, _msg(0.005))
+    samples = a.latency_samples_s()
+    assert samples == [0.005, 0.005, 0.005]
+    samples.append(0.999)  # mutating the returned list must not affect internal state.
+    assert a.latency_samples_s() == [0.005, 0.005, 0.005]
+
+
+def test_latency_samples_s_empty_when_no_acks():
+    """Empty reservoir → empty list."""
+    a = DeliveryAccountant()
+    assert a.latency_samples_s() == []
+
+
 def test_snapshot_consistency():
     a = DeliveryAccountant()
     for _ in range(10):
