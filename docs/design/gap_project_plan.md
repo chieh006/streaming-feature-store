@@ -3,7 +3,7 @@
 **Goal:** Close skill gaps and build a portfolio of hands-on projects to land a Senior/Staff ML Infrastructure or Performance Engineering role at $300K+ TC by end of 2026.  
 **Timeline:** April 2026 – September 2026 (~6 months, part-time / evenings & weekends)  
 **Date Created:** March 21, 2026  
-**Last Updated:** March 21, 2026 — Removed Arrow/Parquet, MLflow/model registry, and PyTorch DataLoader basics (already gained through daily work at ASML)
+**Last Updated:** 2026-05-18 — Phase 1 (Weeks 1–5) revised after the GIL throughput investigation + EOS measurement; see [`week1_load_test_throughput_investigation.md`](../results/week1_load_test_throughput_investigation.md). Earlier: March 21, 2026 — Removed Arrow/Parquet, MLflow/model registry, and PyTorch DataLoader basics (already gained through daily work at ASML)
 
 ---
 
@@ -68,13 +68,17 @@ Build a feature store system that ingests raw events via Kafka with schema evolu
   - **Topic creation (producer-side, for this project only):** The producer uses `AdminClient` on startup to create the `e-commerce-events` topic with 12 partitions and RF=3 if it does not already exist. This is acceptable here because (a) single developer, no review process needed, (b) no operator/Terraform overhead is appropriate at laptop scale, and (c) it teaches the `AdminClient` API, which is also used in integration tests.
   - **Rule of thumb for production (not what this project does):** If more than one service reads or writes a topic, or if it has non-default config (compaction, retention, RF), it should be declaratively managed — not producer-created. Producer-created topics only make sense for truly private, single-owner topics, and even then most organizations forbid it for consistency. In production, topic definitions live in a Git repo and are applied by a dedicated **"infrastructure-as-code pipeline for Kafka"** — parallel to how Terraform manages AWS resources or Helm charts manage Kubernetes services. This pipeline is **not** part of the application's deploy path: it has its own repo, its own reviewers (platform/data-infra team), and cluster-admin credentials that application services never hold. Common implementations: Strimzi `KafkaTopic` CRDs reconciled by an operator, Terraform's Kafka provider, or GitOps tools like `kafka-gitops` / Julie Ops.
 - Build a consumer that reads events and measures end-to-end latency
+  - **Scale consumers as a *consumer group of processes*, not threads — required, not optional (GIL symmetry).** The investigation proved a single Python process caps at ~11–14k evt/s on the GIL. A single-process consumer (the "simple Python script" sink, the latency-benchmark consumer, the Week 5 freshness monitor) hits the *exact same wall* and cannot drain a 50–60k producer. The Kafka-idiomatic fix is the symmetric one: a consumer group with **one process per partition-subset** (≤12), not a multi-threaded single process. State this as a Week 1 objective — it is the strongest portfolio narrative ("found the ceiling on produce, proved the same reasoning on consume"). See [`week1_load_test_throughput_investigation.md`](../results/week1_load_test_throughput_investigation.md) §2.2 / §4.2.
 - Set up a Kafka-to-PostgreSQL sink (Kafka Connect JDBC Sink Connector or a simple Python consumer script) that subscribes to the `e-commerce-events` topic, batches messages (e.g., every 1,000 events or every 10 seconds), and inserts them into a `raw_events` table in PostgreSQL — this runs as a background process from Week 1 onward so that by Week 4, you have a substantial historical dataset for offline feature computation and point-in-time joins
+  - **Two distinct producers — do not conflate them.** The multi-process load harness (`make load-test-mp`) is a ~10 s *burst benchmark*, not a daemon; it cannot be "run continuously from Week 1." What continuously populates `raw_events` is a **separate, low-rate, long-running** synthetic producer (single-process is fine — the GIL ceiling is irrelevant below ~10k/s; ideally on its own topic so a benchmark run never pollutes the historical dataset). Plan line: **MP harness = throughput benchmark (burst, on-demand); background feeder = sink populator (daemon, days, modest rate).**
 - Experiment with partitioning strategies, consumer groups, and exactly-once semantics:
   - **Key-based partitioning:** Hash `user_id` as the message key so all events for a user land in the same partition — guarantees per-user ordering (required for stateful features like "time since last click") and enables independent per-shard scaling
   - **Consumer groups:** Implement the consumer as a coordinated worker that polls raw batches, deserializes events, measures end-to-end latency, and commits offsets (the "success marker" that ensures crash recovery resumes exactly where it left off) — in Week 1 the consumer only reads and benchmarks; the additional steps of computing features and writing to Redis get layered on in Week 2
   - **Exactly-once semantics (EOS):** Enable idempotent producer (broker-side Producer ID + Sequence Number tracking — lightweight RAM checks, feasible at 50K+ evt/sec) as the foundation, then layer on transactions to atomically commit writes to both Redis and PostgreSQL — this eliminates training-serving skew between your offline and online stores
+    - **Throughput vs. EOS profile — DONE (implemented + measured).** The producer has two switchable profiles: `throughput` (fix #1: `acks=1`, non-idempotent — benchmark / GIL-ceiling only) and `eos` (`enable.idempotence=true` ⇒ forced `acks=all` + `max.in.flight=5`). Switch via `ProducerTuning.enable_idempotence` / `--eos` / `make load-test-mp-eos`. **The headline ~60k is a non-EOS number.** Measured result: the EOS tax is *conserved* — **~15% throughput** loss when capacity-bound, or **~2.5–3× p95/p99 tail latency** at unchanged throughput when rate-paced (the production-typical regime). Numbers + the binding-constraint explanation: [`week1_load_test_throughput_investigation.md`](../results/week1_load_test_throughput_investigation.md) §4.4 / §4.4.1.
+    - **Transactional `transactional.id` is per-process.** A transactional producer needs a *stable, unique* `transactional.id`; the multi-process design therefore means **N IDs and per-process transaction scopes**, not one shared transaction. (Pre-existing caveat, not MP-caused: Kafka transactions span only Kafka topics + consumer offsets — they do **not** make the external Redis + PostgreSQL writes atomic. That cross-store atomicity needs an outbox / idempotent-write pattern, not Kafka EOS.)
   - **Read-side EOS:** Configure consumers with `read_committed` isolation so they only see data past the broker's Last Stable Offset (LSO), filtering out uncommitted or aborted transaction data
-- Deliverable: Running Kafka cluster with producer/consumer benchmarks, and a continuously-populating `raw_events` table in PostgreSQL
+- Deliverable: Running Kafka cluster with (a) producer benchmarks **including the GIL throughput investigation + ~5× multi-process scaling result and the EOS throughput/latency measurement** ([`week1_load_test_throughput_investigation.md`](../results/week1_load_test_throughput_investigation.md)) as a first-class artifact; (b) a consumer implemented as a **consumer group of processes** with end-to-end latency benchmarks; and (c) a continuously-populating `raw_events` table in PostgreSQL fed by the separate low-rate background producer
 
 **Week 2 — Validation & Feature Computation**
 - **Validation layer:** Implement an inline validation stage in the stream processor that checks incoming events for: null/missing required fields, out-of-range values (e.g., negative prices, timestamps in the future), malformed records, and schema conformance against the registry — route invalid events to a `dead-letter-queue` topic with error metadata for debugging
@@ -83,12 +87,14 @@ Build a feature store system that ingests raw events via Kafka with schema evolu
   - Session-based features (session duration, pages per session) — uniquely streaming (gap timeouts, session windows); skip if time-constrained
 - Write computed features to Redis for online serving
 - Deliverable: Stream processor computing windowed + session features in real-time with <100ms end-to-end latency
+  - **GIL caveat + latency recalibration.** Flink / Kafka Streams are JVM — no GIL, so feature computation there is insulated. If computation is instead done in **Python** (Faust / custom consumer), the single-process GIL ceiling returns — prefer Flink, or scale Python workers as *processes*. Also recalibrate the **<100 ms** budget against realistic **`acks=all`** producer latency, not the `acks=1` load-test p95 (~47 ms, MP-8): under EOS the producer-side tail shifts up materially (investigation doc §4.4.1).
 
 **Week 3 — Online Feature Serving Layer**
 - Build a REST API (FastAPI) that serves features for a given entity (user ID) from Redis — skip gRPC here; you will build gRPC streaming in Phase 3 (LLM serving) where it actually matters
 - Implement a feature vector assembly endpoint that joins features from multiple feature groups
 - Benchmark: target <5ms p99 latency for single-entity feature vector retrieval (Redis on a laptop will hit this without explicit caching/pooling work; be ready to discuss those patterns in interviews without having implemented them)
 - Deliverable: Feature serving API with latency benchmarks
+  - *(Thematic note, not a plan change.)* The serving path is read-from-Redis and unaffected by the producer-side GIL/EOS work. The same process-not-thread reasoning recurs at the edge: scale FastAPI via **uvicorn/gunicorn worker *processes***, not threads — worth one sentence in the write-up for narrative consistency.
 
 **Week 4 — Offline Feature Store & Online/Offline Consistency**
 
@@ -96,14 +102,20 @@ The streaming-specific lesson of this week is **online/offline consistency** —
 
 - Build a minimal batch pipeline in DuckDB that computes the same features from the historical `raw_events` table — a single SQL query is enough; do not generalize
 - Implement the simplest possible point-in-time-correct join (one query with a timestamp filter to prevent future-info leakage) — PIT correctness is the one offline-store concept worth being able to articulate ("why naive joins leak future info"), but do not partition by date or build a reusable PIT framework
-- **Invest here:** Validate online/offline consistency by comparing real-time computed features against batch-computed features for the same entity + time window; characterize where and why they diverge (late events, window boundaries, clock skew)
+- **Invest here:** Validate online/offline consistency by comparing real-time computed features against batch-computed features for the same entity + time window; characterize where and why they diverge (late events, window boundaries, clock skew, **multi-producer interleaving**)
+  - **Multi-producer interleaving is an MP-introduced divergence source — and a *better* interview story than the synthetic ones.** The same `user_id` is produced concurrently by 6 decorrelated processes, so the per-user event *interleaving* is non-deterministic across runs (OS-scheduling dependent). Kafka still totally-orders each user *within its partition*, so stateful-feature **correctness is preserved**; but the synthetic dataset is **not bit-reproducible at the per-user-sequence level**, even though each process is individually seeded.
+  - **Reproducibility note.** For a deterministic offline replay, either partition the `user_id` universe disjointly across processes (cleaner; aligns with "independent per-shard scaling") **or** accept and document the non-determinism. Recommended: the latter — the divergence *is* the lesson here.
+  - **Feeder durability note.** If the background feeder runs `acks=1`, the offline dataset can have silent holes on broker failure. Move the feeder to idempotent + `acks=all` once Week 1 EOS lands — it is low-rate, so the ~15% EOS throughput tax is irrelevant there.
 - Emit the batch result as a single Parquet file (no date partitioning, no version tagging) — dataset versioning and reproducible-snapshot machinery are batch/MLops concerns you can describe in interviews without building
 - Deliverable: One-query batch pipeline + an online/offline consistency report explaining observed divergences
 
 **Week 5 — Monitoring, Testing & Documentation**
 - Add data freshness monitoring (alert if a feature hasn't been updated within SLA) — streaming-specific and interview-relevant; skip statistical drift detection (KS / PSI) since it's an ML-monitoring topic, not a streaming one, and shallow implementations are worse than none
+  - **GIL caveat.** The freshness-monitoring consumer is yet another single-process Python consumer — size it as a **consumer-group member (process)**, same reasoning as the Week 1 sink.
 - Write integration tests that validate end-to-end correctness from event to served feature
+  - **Throughput-assertion split.** Point the 50k-floor throughput assertion at the **multi-process harness** (`load_mp`); keep the single-process **threading** harness's 50k test as a **config-sanity check that fails by design** on this hardware (it documents the GIL ceiling — investigation doc §4.3). The "integration tests that validate end-to-end correctness" line should adopt this split explicitly.
 - Create architecture diagram and write-up explaining online/offline consistency challenges
+  - **Elevate the GIL/EOS investigation.** It is the highest-signal artifact in the repo and maps directly onto the Phase 5 system-design problem *"Design a high-throughput data ingestion system for 1B events/day."* Feature it prominently in both the Week 5 write-up and the Phase 5 portfolio narrative.
 - Deliverable: GitHub repo with full system, monitoring dashboard, and architecture documentation
 
 ### Learning Objectives
@@ -116,6 +128,8 @@ After this project, you should be able to:
 - Articulate why point-in-time correctness matters for ML training and how to implement it
 - Explain online/offline feature consistency: where real-time and batch values diverge and why (late events, window boundaries, clock skew)
 - Discuss data freshness monitoring for streaming feature pipelines (and articulate — without having implemented — how dataset versioning and statistical drift detection would extend the system)
+- Explain the CPython GIL throughput ceiling for a Pydantic + Avro + Kafka producer, why five in-process fixes all failed, and why scaling by *processes* (not threads; `W ≈ round(1/s)` workers each) gives ~5× — and that the same reasoning applies symmetrically to consumers
+- Quantify the exactly-once (EOS) cost as a *conserved* tax: ~15% throughput when capacity-bound vs ~2.5–3× tail latency when rate-paced, and explain which regime production runs in
 - Answer system design questions like "Design a real-time feature platform for a recommendation system" or "How do you handle schema changes in a production ML data pipeline?"
 
 ---
@@ -336,7 +350,7 @@ Practice designing these systems (write full documents with diagrams for each):
 | Design a real-time recommendation feature platform | Phase 1 (feature store, Kafka, online/offline) |
 | Design an LLM serving system for 100K RPM | Phase 3 (continuous batching, KV-cache, scheduling) |
 | Design an ML platform for 50 engineering teams | Daily work (MLflow) + Phase 4 (K8s, pipeline orchestration) |
-| Design a high-throughput data ingestion system for 1B events/day | ASML work + Phase 1 (Kafka streaming) |
+| Design a high-throughput data ingestion system for 1B events/day | ASML work + Phase 1 (Kafka streaming; **GIL ceiling → multi-process ~5× escape; EOS throughput-vs-latency tradeoff** — see `week1_load_test_throughput_investigation.md`) |
 | Design a model monitoring and rollback system | Phase 4 (canary, drift detection, alerting) |
 
 For each design, structure your answer as:

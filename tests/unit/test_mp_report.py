@@ -189,3 +189,44 @@ def test_render_markdown_unpaced_label():
     )
     md = render_markdown(report)
     assert "unpaced" in md
+
+
+def test_render_markdown_labels_throughput_profile_by_default():
+    """Default config (``eos=False``) labels the throughput profile."""
+    cfg = MultiprocessLoadConfig(
+        duration_s=1.0, target_rate=60_000.0, processes=1, workers_per_process=1
+    )
+    assert cfg.eos is False
+    report = MultiprocessLoadReport(
+        config=cfg,
+        started_at=datetime.now(tz=timezone.utc),
+        process_outcomes=[_outcome(0)],
+        aggregate_snapshot=_snapshot(),
+        sustained_rate_eps=100.0,
+        floor_eps=0.0,
+    )
+    md = render_markdown(report)
+    assert "Producer profile" in md
+    assert "throughput (acks=1, no idempotence)" in md
+    assert "EOS (idempotent" not in md
+
+
+def test_render_markdown_labels_eos_profile_when_eos_true():
+    """``eos=True`` labels the EOS profile in the rendered report."""
+    cfg = MultiprocessLoadConfig(
+        duration_s=1.0,
+        target_rate=60_000.0,
+        processes=1,
+        workers_per_process=1,
+        eos=True,
+    )
+    report = MultiprocessLoadReport(
+        config=cfg,
+        started_at=datetime.now(tz=timezone.utc),
+        process_outcomes=[_outcome(0)],
+        aggregate_snapshot=_snapshot(),
+        sustained_rate_eps=100.0,
+        floor_eps=0.0,
+    )
+    md = render_markdown(report)
+    assert "Producer profile | EOS (idempotent, acks=all, max.in.flight=5)" in md

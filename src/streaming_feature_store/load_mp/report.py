@@ -57,6 +57,14 @@ class MultiprocessLoadConfig(BaseModel):
         Defaults to ``42``.
     topic : str, optional
         Target Kafka topic.  Defaults to ``"e-commerce-events"``.
+    eos : bool, optional
+        Records which producer profile the run used, purely for the
+        rendered report.  ``True`` = EOS (idempotent, ``acks=all``,
+        ``max.in.flight=5``); ``False`` (default) = throughput
+        (``acks=1``, no idempotence).  The actual switch is the
+        ``KAFKA_PRODUCER_ENABLE_IDEMPOTENCE`` env var read by
+        :class:`~streaming_feature_store.config.ProducerTuning` in each
+        child; this flag only labels the artifact.
 
     Notes
     -----
@@ -74,6 +82,7 @@ class MultiprocessLoadConfig(BaseModel):
     max_in_flight: int = Field(default=50_000, ge=1)
     seed: int = 42
     topic: str = "e-commerce-events"
+    eos: bool = False
 
     @field_validator("target_rate")
     @classmethod
@@ -254,6 +263,11 @@ def render_markdown(report: MultiprocessLoadReport) -> str:
     lines.append(f"| Batch size | {cfg.batch_size} |")
     lines.append(f"| Max in-flight (per process) | {cfg.max_in_flight} |")
     lines.append(f"| Seed | {cfg.seed} |")
+    if cfg.eos:
+        profile = "EOS (idempotent, acks=all, max.in.flight=5)"
+    else:
+        profile = "throughput (acks=1, no idempotence)"
+    lines.append(f"| Producer profile | {profile} |")
     lines.append("")
     lines.append("## Aggregate results")
     lines.append("")

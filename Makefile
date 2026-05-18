@@ -8,7 +8,7 @@ COMPOSE_FILE := docker/docker-compose.yml
         schema-evolution-report \
         topic-ensure topic-describe \
         load-test load-test-quick load-test-report test-benchmark \
-        load-test-mp load-test-mp-quick load-test-mp-report \
+        load-test-mp load-test-mp-quick load-test-mp-report load-test-mp-eos \
         test test-unit test-integration install
 
 # ---------------------------------------------------------------------------
@@ -142,6 +142,10 @@ test-benchmark:  ## Run the 10s/50K-floor benchmark integration test explicitly
 
 load-test-mp:  ## Run a 10s, 60K evt/s multi-process load test and write the report
 	uv run python scripts/run_event_load_mp.py --duration-s 10 --target-rate 60000
+
+load-test-mp-eos:  ## Run the 10s, 60K evt/s load test with the EOS profile (idempotent, acks=all)
+	uv run python scripts/run_event_load_mp.py --duration-s 10 --target-rate 60000 \
+	  --eos --report-path docs/results/week1_load_test_results_mp_eos.md
 
 load-test-mp-quick:  ## Smoke run: 2s, 5K evt/s aggregate, 2 processes, no floor
 	uv run python scripts/run_event_load_mp.py --duration-s 2 --target-rate 5000 \

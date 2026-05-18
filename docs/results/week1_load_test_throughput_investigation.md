@@ -20,6 +20,17 @@ each with its own interpreter and GIL, results aggregated by the parent.
 At **6 processes × 2 workers** it sustains **~59–62k evt/s** with zero
 failures — **clears the 50k floor**, ~5× the single-process number.
 
+**Durability caveat — the headline number is not an EOS number.** The
+~59–62k figure used the load-test **throughput profile** (`acks=1`,
+idempotence off, no transactions, unbounded in-flight) — verified in
+code. The Week 1 plan's exactly-once (EOS) guarantees (idempotent
+producer + transactions ⇒ `acks=all`, `max.in.flight ≤ 5`) impose a
+separate durability tax. **Now measured (2026-05-18):** the tax is
+*conserved* — capacity-bound it costs **~15% throughput**; in the
+production-typical rate-paced regime it costs **~2.5–3× tail latency**
+at ~unchanged throughput. See
+[§4.4.1](#441-measured-result-2026-05-18).
+
 **Key tuning insight (counter-intuitive).** Workers-per-process has an
 **optimum (2 here), not "fewer is always better."** 4×3 = 34.5k but
 6×2 = 60.9k (same 12 total threads). 8×1 does *not* beat 6×2 either.
@@ -396,6 +407,9 @@ evt/s, scale by **processes, not threads**:
 - **Note on `acks=1`:** load-test/dev only. Production should use
   `acks=all`; the relative process-vs-thread conclusions hold but the
   absolute latency numbers shift up by the replication round-trip.
+  Every throughput number in this document is the *throughput profile*;
+  the EOS-profile throughput is **unmeasured** — see
+  [§4.4](#44-throughput-profile-vs-eos-profile).
 
 ### 4.3 Status of the harnesses
 
@@ -410,6 +424,103 @@ evt/s, scale by **processes, not threads**:
   **throughput-targeting** tool. Six processes, ~59k evt/s today,
   passes the 50k floor. Reuses the threading runner internally inside
   each child; only the orchestration layer is separate.
+
+### 4.4 Throughput profile vs. EOS profile
+
+**The headline 50–62k evt/s is a non-EOS number.** Every run in this
+document — single-process and multi-process, including the canonical
+MP-8 / MP-9 — was produced with the load-test **throughput profile**.
+This is code-verified, not assumed: `ProducerTuning`
+([config.py](../../src/streaming_feature_store/config.py)) exposes only
+the fix #1 knobs; `_build_producer`
+([avro_producer.py](../../src/streaming_feature_store/producer/avro_producer.py))
+emits only those plus connection basics; and a whole-package search for
+`idempoten | transactional | init_transaction | begin_transaction`
+finds **no producer-side idempotence or transaction code anywhere**.
+
+| Setting | Required for EOS | Actual in every run here |
+|---|---|---|
+| `acks` | `all` | **`1`** — explicit `ProducerTuning` default, self-documented "NOT for production" |
+| `enable.idempotence` | `true` | **never set → librdkafka default `false`** |
+| `transactional.id` | required, unique per process | **absent** |
+| `max.in.flight.requests.per.connection` | **≤ 5** | **never set → librdkafka default 1,000,000** (max pipelining — the opposite of EOS) |
+
+The Week 1 plan mandates EOS for the real ingestion pipeline (idempotent
+producer + transactions, to eliminate training-serving skew between the
+offline and online stores). EOS forces the opposite config bundle and
+adds a **durability tax** — replication round-trip (`acks=all`), capped
+pipelining (`max.in.flight ≤ 5`), idempotence/transaction bookkeeping —
+that this investigation never paid. The **GIL tax** (escaped via
+multiprocessing) and the **EOS/durability tax** are independent;
+clearing the 50k floor on the throughput profile says nothing about
+whether the EOS profile clears it.
+
+**Consequence for the verdicts.** Every "✅ clears the 50k floor" in
+the numbered runs (MP-1…MP-9) is a **non-EOS verdict**. The
+EOS-profile throughput *was* unmeasured; it has since been measured —
+see [§4.4.1](#441-measured-result-2026-05-18).
+
+**Action — implemented.** Two named producer profiles now exist and are
+both benchmarkable on the MP harness:
+
+- `throughput` — fix #1, `acks=1`, non-idempotent. **Benchmark /
+  GIL-ceiling demonstration only.** This is what every numbered run
+  above measures. Driver: `make load-test-mp`.
+- `eos` — `enable.idempotence=true` ⇒ `acks=all`, `max.in.flight = 5`
+  (idempotent-producer foundation; full transactional `transactional.id`
+  is a further, larger change not yet wired). Switched via
+  `ProducerTuning.enable_idempotence` /
+  `KAFKA_PRODUCER_ENABLE_IDEMPOTENCE`. Driver: `make load-test-mp-eos`
+  (separate report: `week1_load_test_results_mp_eos.md`).
+
+### 4.4.1 Measured result (2026-05-18)
+
+The `eos` profile was benchmarked against the `throughput` profile on
+the canonical 6×2 MP harness, same session, in two power states.
+**Headline: the EOS durability tax is conserved, but its *symptom*
+depends on the binding constraint.**
+
+| Regime | Binding constraint | non-EOS | EOS | EOS effect |
+|---|---|---|---|---|
+| Laptop **on battery**, paced 60k | producer capacity (< 60k cap) | ~47.1k evt/s | ~40.2k evt/s | **throughput −15%** |
+| **Plugged in (AC)**, paced 60k | pacer (both capacities > 60k cap) | 61,693 evt/s · p50/p95/p99 88/105/124 ms | 61,846 evt/s · p50/p95/p99 91/**264**/**370** ms | **throughput ≈0; p95/p99 ×2.5–3** (p50 unchanged) |
+
+Reading:
+
+- **The cost is real and constant** — the `acks=all` replication
+  round-trip plus `max.in.flight=5` reduced pipelining. It does not
+  vanish when plugged in; it *relocates*.
+- **Capacity-bound** (battery, or any `--unpaced` run): both profiles
+  run flat-out at their true ceilings; EOS's ceiling is ~15% lower, so
+  the tax shows as a **~15% throughput** loss.
+- **Rate-bound** (plugged in at the paced target — the
+  production-typical regime, see [§4.2](#42-production-guidance)):
+  throughput is pinned to the pace for *both* profiles, so the tax
+  shows almost entirely as **~2.5–3× p95/p99 tail latency** with
+  ~unchanged p50 and throughput. All EOS runs: `produced == acked`,
+  `failed = 0`, errors `{}` — the guarantee works; the latency is its
+  price, paid as designed.
+- **The 50k-floor verdict, refined.** Plugged in and rate-paced, the
+  `eos` profile **still clears the floor** (sustained ~60k) — but only
+  because it was *pace-bound*, and it pays in tail latency. The
+  floor-breach risk flagged above is real **only when offered load
+  approaches the EOS ceiling** (battery, under-provisioning, backlog
+  drain), where the latency cost converts back into throughput loss and
+  consumer lag.
+
+**Still unmeasured (honest bound).** The paced plugged-in run proves the
+EOS *capacity ceiling* is > 60k on AC but cannot quantify it (it was
+pace-bound — the pacer, not the producer, set the rate). The true AC EOS
+ceiling — hence the real headroom before the tax converts to throughput
+loss — requires an `--unpaced` pair. Until then the AC EOS capacity is
+bounded, not measured.
+
+**Engineering takeaway.** Under EOS at a sane operating rate, the budget
+you must defend is **p95/p99 latency**, not throughput — *provided*
+capacity is sized to keep the pipeline comfortably pace-bound. Size the
+process count so the EOS ceiling stays well above offered load; if it
+doesn't, the durability tax reappears as the throughput/lag problem this
+section warns about.
 
 ---
 

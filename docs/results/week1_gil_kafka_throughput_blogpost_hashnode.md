@@ -202,6 +202,27 @@ laptop benchmark number doesn't.
 
 ---
 
+## Coda: a second, independent tax
+
+The GIL was a *throughput* tax. The pipeline also has to be *correct* —
+exactly-once (idempotent producer, `acks=all`, in-flight capped at 5),
+which costs something too. I measured it the same way: one change, A/B.
+
+The interesting part isn't the number — it's that **the number has no
+fixed symptom.** On the laptop *on battery* (CPU-bound, below the rate
+target) EOS cost **~15% throughput**. *Plugged in* and rate-paced at the
+target — the regime production actually runs in — throughput and p50
+were **identical**; the entire cost moved into the tail: **p95/p99 ~3×**.
+Same fixed per-event cost, conserved; whether it bills you in throughput
+or in latency depends purely on whether you're capacity-bound or
+rate-bound. (Honest caveat, again: the plugged-in *ceiling* is still
+unmeasured — paced runs can't see it.)
+
+Same lesson as the GIL, one layer up: **a cost doesn't tell you where it
+will land — the binding constraint does.**
+
+---
+
 ## What I'd tell another engineer
 
 1. **Profile before optimizing.** My one regression came from shipping

@@ -91,6 +91,16 @@ class ProducerTuning(BaseSettings):
     batch_size : int
         ``batch.size`` — max bytes per physical batch sent to the broker.
         ``2_000_000`` allows ~2 MB batches; default librdkafka is 1 MB.
+    enable_idempotence : bool
+        When ``True``, switch to the **EOS (exactly-once) producer profile**:
+        emit ``enable.idempotence=true`` and force the two settings
+        librdkafka *requires* for idempotence — ``acks=all`` (overriding
+        whatever ``acks`` is set to) and
+        ``max.in.flight.requests.per.connection=5``. Default ``False``
+        keeps the throughput profile (``acks`` as configured, no idempotence,
+        unbounded in-flight). This is the *idempotent-producer* foundation
+        of EOS; full transactional EOS additionally needs a
+        ``transactional.id`` and the transaction API (not configured here).
 
     Notes
     -----
@@ -130,6 +140,13 @@ class ProducerTuning(BaseSettings):
         ge=1,
         description="librdkafka batch.size in bytes",
     )
+    enable_idempotence: bool = Field(
+        default=False,
+        description=(
+            "EOS switch: enable.idempotence=true and force acks=all + "
+            "max.in.flight=5 (load-test default False = throughput profile)"
+        ),
+    )
 
     model_config = {"env_prefix": "KAFKA_PRODUCER_"}
 
@@ -140,9 +157,11 @@ class ProducerTuning(BaseSettings):
         -------
         dict[str, object]
             Mapping suitable for merging into the
-            :class:`SerializingProducer` config dict.
+            :class:`SerializingProducer` config dict.  When
+            ``enable_idempotence`` is ``True`` the returned mapping also
+            carries the three EOS keys and ``acks`` is forced to ``"all"``.
         """
-        return {
+        conf: dict[str, object] = {
             "linger.ms": self.linger_ms,
             "compression.type": self.compression_type,
             "queue.buffering.max.messages": self.queue_buffering_max_messages,
@@ -150,6 +169,14 @@ class ProducerTuning(BaseSettings):
             "acks": self.acks,
             "batch.size": self.batch_size,
         }
+        if self.enable_idempotence:
+            # librdkafka rejects enable.idempotence unless acks=all and
+            # max.in.flight.requests.per.connection <= 5, so both are forced
+            # here regardless of the configured `acks`.
+            conf["enable.idempotence"] = True
+            conf["acks"] = "all"
+            conf["max.in.flight.requests.per.connection"] = 5
+        return conf
 
 
 class PostgresConfig(BaseSettings):

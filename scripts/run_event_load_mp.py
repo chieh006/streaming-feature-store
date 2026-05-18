@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -81,6 +82,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Per-process backpressure cap.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--eos",
+        action="store_true",
+        help="Use the EOS (exactly-once) producer profile: idempotent "
+        "producer, acks=all, max.in.flight=5. Default is the throughput "
+        "profile (acks=1, no idempotence). Lowers throughput by the "
+        "durability tax; use it to measure that cost.",
+    )
     parser.add_argument("--floor-eps", type=float, default=50_000.0)
     parser.add_argument("--report-path", type=Path, default=_DEFAULT_REPORT_PATH)
     parser.add_argument(
@@ -117,6 +126,30 @@ def _ensure_topic(kafka_config: KafkaConfig, topic: str) -> None:
     logger.info(f"TopicAdmin.ensure_topic {topic!r} -> {result.outcome.value}")
 
 
+def _apply_eos_profile(enable: bool) -> None:
+    """Export the env var that flips :class:`ProducerTuning` into EOS mode.
+
+    Parameters
+    ----------
+    enable : bool
+        When ``True``, set ``KAFKA_PRODUCER_ENABLE_IDEMPOTENCE=true`` in the
+        current process environment.  ``spawn``-ed child processes inherit
+        this environment, so each child's ``ProducerTuning()`` picks it up
+        without threading a tuning object through the pickling boundary.
+        When ``False`` this is a no-op (throughput profile).
+
+    Notes
+    -----
+    Must be called *before* the process pool is created.
+    """
+    if enable:
+        os.environ["KAFKA_PRODUCER_ENABLE_IDEMPOTENCE"] = "true"
+        logger.info(
+            "EOS profile enabled: idempotent producer, acks=all, "
+            "max.in.flight=5 (KAFKA_PRODUCER_ENABLE_IDEMPOTENCE=true)"
+        )
+
+
 def _run(args: argparse.Namespace) -> int:
     """Execute the configured multi-process load run.
 
@@ -130,6 +163,7 @@ def _run(args: argparse.Namespace) -> int:
     int
         Process exit code (``0`` on pass, ``1`` on fail).
     """
+    _apply_eos_profile(args.eos)
     kafka_config = KafkaConfig()
     registry_config = SchemaRegistryConfig()
     topic = args.topic or kafka_config.topic
@@ -156,6 +190,7 @@ def _run(args: argparse.Namespace) -> int:
         max_in_flight=args.max_in_flight,
         seed=args.seed,
         topic=topic,
+        eos=args.eos,
     )
     runner = MultiprocessLoadRunner(
         kafka_config,

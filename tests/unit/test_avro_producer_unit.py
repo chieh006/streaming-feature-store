@@ -352,6 +352,41 @@ def test_producer_tuning_as_librdkafka_conf_keys() -> None:
     } == set(keys)
 
 
+def test_producer_tuning_default_is_throughput_profile() -> None:
+    """Default tuning must NOT enable idempotence (throughput profile)."""
+    tuning = ProducerTuning()
+    assert tuning.enable_idempotence is False
+    conf = tuning.as_librdkafka_conf()
+    assert "enable.idempotence" not in conf
+    assert "max.in.flight.requests.per.connection" not in conf
+
+
+def test_producer_tuning_eos_profile_forces_acks_and_in_flight() -> None:
+    """EOS profile must emit idempotence and force acks=all + in-flight<=5.
+
+    ``acks`` is deliberately set to ``"1"`` to prove the EOS branch
+    overrides it (librdkafka rejects idempotence with ``acks=1``).
+    """
+    tuning = ProducerTuning(enable_idempotence=True, acks="1")
+    conf = tuning.as_librdkafka_conf()
+    assert conf["enable.idempotence"] is True
+    assert conf["acks"] == "all"
+    assert conf["max.in.flight.requests.per.connection"] == 5
+    # Base throughput knobs are still carried through.
+    assert conf["compression.type"] == "lz4"
+    assert conf["batch.size"] == 2_000_000
+
+
+def test_producer_tuning_enable_idempotence_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``KAFKA_PRODUCER_ENABLE_IDEMPOTENCE`` env var must flip the profile."""
+    monkeypatch.setenv("KAFKA_PRODUCER_ENABLE_IDEMPOTENCE", "true")
+    tuning = ProducerTuning()
+    assert tuning.enable_idempotence is True
+    assert tuning.as_librdkafka_conf()["acks"] == "all"
+
+
 def test_purchase_event_routes_through_to_dict_adapter() -> None:
     """The to_dict adapter must produce serializer-compatible shape."""
     event = EcommerceEvent(
