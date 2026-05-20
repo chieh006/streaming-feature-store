@@ -716,7 +716,22 @@ contrast. Tagged `@pytest.mark.benchmark`; excluded from default
 
 ## 7. How to Run
 
-> Prereqs: `make infra-up` → `make infra-status` → `make register-schemas`.
+> Prereqs: `make infra-up` → `make infra-status` → `make register-schemas` →
+> `make topic-ensure` (same order as PR #4 §7 / §7.1).
+>
+> `make topic-ensure` idempotently creates `e-commerce-events` (12p, RF=3):
+> ```bash
+> uv run python -m streaming_feature_store.admin.topic_admin ensure
+> ```
+> It is required here because the consume side **only reads** —
+> `run_event_consume_mp.py` never creates the topic — and the 12-partition
+> count is load-bearing (the planner caps members at `min(partitions,
+> cpu_budget)`; the symmetric-GIL demo needs all 12). It is idempotent
+> (no-op if the topic exists) and removes the cold-start auto-create RF<3
+> race; `make load-test-mp` would also ensure it as a side effect, but
+> running it here makes the topology guarantee explicit and lets the
+> consumer be run in isolation.
+>
 > Generate something to consume first (PR #4): `make load-test-mp` (or seed a
 > per-test topic in integration fixtures).
 
@@ -740,6 +755,107 @@ make test-unit                # no Docker
 make test-integration         # needs infra; per-test topics
 make test-benchmark           # the 1-vs-N 50K backlog contrast
 ```
+
+> **The `make consume-test` ❌ "lag ramped" line and the millisecond e2e
+> numbers above only occur with a producer running _concurrently_** (a
+> producer outpacing the consumer is what makes lag *climb* and keeps
+> `CreateTime` fresh). Both `consume-test` and `consume-test-mp` default
+> to `--group-id wk1-consume`, so run **sequentially** against a *finite,
+> already-produced* backlog they (a) couple through committed offsets —
+> the second run resumes past the first and sees ≈nothing — and (b) only
+> ever show lag *decreasing*, never ramping. §7.2 is the correct recipe
+> for the sequential (produce-then-consume) flow; the concurrent lag-ramp
+> demonstration is the `make test-benchmark` path
+> (`test_single_member_cannot_drain_50k_backlog` /
+> `test_member_group_drains_50k_backlog`, which run a background producer).
+
+### 7.2 Sequential controlled comparison (produce-then-consume, distinct group IDs)
+
+Ordering:
+
+1. `make load-test-mp` — produce a static backlog.
+2. `make consume-test` **with its own `--group-id`** — 1-member control.
+3. `make consume-test-mp` **with a _different_ `--group-id`** — N-member group.
+
+This ordering is correct, and **distinct group IDs for (2) and (3) are the
+fix for the offset-coupling problem**. With distinct group IDs neither run
+has a prior committed offset, so `auto.offset.reset=earliest` applies and
+each independently re-reads the full backlog from the start. (3) is **not**
+starved by (2); the data is all still in the broker (read is
+non-destructive). As a controlled comparison of 1-member vs N-member
+draining the *same static backlog*, this is sound.
+
+One persistent caveat — this is **produce-then-consume against a static
+backlog**, not the concurrent latency/ramp experiment:
+
+- **Valid metrics here:** `consumed == backlog size`,
+  `deserialize_failed == 0`, `end_lag → 0`, time-to-drain, and drain
+  throughput (~12k evt/s for 1 member vs ~N×12k for the group — the real
+  GIL-scaling evidence).
+- **NOT reproduced here:** `lag_ramped` is `False` for *both* (a finite
+  static backlog only drains — lag decreases, never ramps). `consume-test`
+  reports ✅, **not** the ❌ "Fell behind: lag ramped" shown in §7.1. And
+  `e2e p50/p95/p99` will be **large (seconds)** — it measures how long
+  messages sat in the log since `make load-test-mp` (staleness), not
+  pipeline latency — so *not* the ~7/22/39 ms in §4.8.
+
+To get the headline lag-ramp ❌ and millisecond e2e, the producer must run
+**concurrently** with the consumer (what the `make test-benchmark`
+integration tests do). This ordering is the correct
+**correctness/throughput** experiment; it is **not** the latency/ramp
+experiment.
+
+### 7.3 Commands (distinct `--group-id` per run)
+
+The flag is `--group-id`; a distinct value per run = an independent full
+re-read. A distinct `--report-path` per run keeps the second run from
+overwriting the first's report.
+
+```bash
+# 1) produce a static backlog (~600K events)
+make load-test-mp
+
+# 2) control: 1-member group (owns all 12 partitions), its own group id
+uv run python scripts/run_event_consume_mp.py \
+  --duration-s 120 --until-caught-up --members 1 \
+  --group-id wk1-consume-1member \
+  --report-path docs/results/week1_consume_results_1member.md
+
+# 3) escape: planned N-member group, a DIFFERENT group id → re-reads the
+#    same backlog fresh
+uv run python scripts/run_event_consume_mp.py \
+  --duration-s 120 --until-caught-up \
+  --group-id wk1-consume-group \
+  --report-path docs/results/week1_consume_results_mp.md
+```
+
+**Why `--until-caught-up` + a generous `--duration-s` are required here
+(not optional).** With a static backlog, `--duration-s` alone is the
+*wrong* termination signal. The per-member deadline starts at
+`subscribe()` time
+([`consume_runner.py` `deadline = monotonic() + duration_s`](../../src/streaming_feature_store/consume/consume_runner.py))
+and the run pays a **fixed startup tax** of roughly 5 seconds — `spawn`
+cold-imports per child plus the **rebalance storm**: with members joining
+one-by-one as their spawns complete, the broker re-runs the group
+assignment for every new arrival and parks every existing member during
+each rebalance (§2.5; the symmetric-consumer counterpart to PR #4's
+`spawn` cost). The tax is independent of *N* and independent of
+`--duration-s`. So a short window like `--duration-s 10` is consumed
+mostly by startup, members get only 4–9 productive `poll_batch` calls
+before the deadline fires, and aggregate throughput collapses below the
+1-member control. (Observed first-hand: an 8-member run at `--duration-s
+10` reported ~8.7K evt/s aggregate vs the 1-member's 22K — wrong by
+construction, not a GIL signal.)
+
+`--until-caught-up` switches the loop's exit rule from *external timer*
+to *natural completion*: the member exits the moment `end_lag` hits 0
+(its assignment is drained), so `wallclock_s` reflects actual drain time
+and `sustained_consume_eps = consumed / wallclock_s` becomes the clean
+1-vs-N number. `--duration-s 120` is then a *give-up* safety cap (not the
+measurement window); in a healthy run `--until-caught-up` fires first and
+the cap is never reached. Same principle as the production rule "keep
+consumers long-lived" — let the steady-state phase dominate the
+measurement so the fixed startup tax amortizes to noise.
 
 ---
 

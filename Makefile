@@ -9,6 +9,7 @@ COMPOSE_FILE := docker/docker-compose.yml
         topic-ensure topic-describe \
         load-test load-test-quick load-test-report test-benchmark \
         load-test-mp load-test-mp-quick load-test-mp-report load-test-mp-eos \
+        consume-test consume-test-mp consume-test-mp-quick consume-test-report \
         test test-unit test-integration install
 
 # ---------------------------------------------------------------------------
@@ -156,3 +157,22 @@ load-test-mp-report:  ## Open the multi-process report
 	@xdg-open docs/results/week1_load_test_results_mp.md 2>/dev/null \
 	  || open docs/results/week1_load_test_results_mp.md 2>/dev/null \
 	  || echo "Report at docs/results/week1_load_test_results_mp.md"
+
+# ---------------------------------------------------------------------------
+# Multi-process consumer group (Week 1 — symmetric GIL ceiling, consume side)
+# ---------------------------------------------------------------------------
+
+consume-test:  ## 1-member consumer (control: shows the single-process GIL ceiling)
+	uv run python scripts/run_event_consume_mp.py --duration-s 10 --members 1
+
+consume-test-mp:  ## N-member consumer group (planned; drains the producer)
+	uv run python scripts/run_event_consume_mp.py --duration-s 10
+
+consume-test-mp-quick:  ## Smoke: 2s, 1 member, no verdict
+	uv run python scripts/run_event_consume_mp.py --duration-s 2 --members 1 \
+	  --report-path /tmp/_consume_quick.md
+
+consume-test-report:  ## Open the generated consume report
+	@xdg-open docs/results/week1_consume_results_mp.md 2>/dev/null \
+	  || open docs/results/week1_consume_results_mp.md 2>/dev/null \
+	  || echo "Report at docs/results/week1_consume_results_mp.md"

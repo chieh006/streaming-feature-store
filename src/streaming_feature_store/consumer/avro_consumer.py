@@ -23,7 +23,7 @@ from types import TracebackType
 from typing import Any
 from uuid import UUID
 
-from confluent_kafka import DeserializingConsumer
+from confluent_kafka import OFFSET_INVALID, DeserializingConsumer
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import StringDeserializer
 
@@ -159,6 +159,12 @@ class AvroEventConsumer:
     auto_offset_reset : str, optional
         Offset reset policy for the consumer group.  Defaults to
         ``"earliest"`` (drills want to read every produced message).
+    isolation_level : str, optional
+        librdkafka ``isolation.level`` — ``"read_uncommitted"`` (default) or
+        ``"read_committed"``.  ``read_committed`` is wired here as a config
+        seam for the deferred read-side EOS PR; against the default
+        non-transactional producer it only adds last-stable-offset wait and
+        is otherwise inert (see design doc §2.7).
     """
 
     def __init__(
@@ -169,12 +175,14 @@ class AvroEventConsumer:
         topic: str | None = None,
         reader_schema_str: str | None = None,
         auto_offset_reset: str = "earliest",
+        isolation_level: str = "read_uncommitted",
     ) -> None:
         self._kafka_config = kafka_config
         self._registry_config = registry_config
         self._topic = topic or kafka_config.topic
         self._group_id = group_id
         self._auto_offset_reset = auto_offset_reset
+        self._isolation_level = isolation_level
         self._reader_schema_str = reader_schema_str
         self._registry = SchemaRegistry(registry_config)
         self._deserializer = self._build_deserializer()
@@ -203,6 +211,17 @@ class AvroEventConsumer:
             Reader schema; ``None`` if writer = reader.
         """
         return self._reader_schema_str
+
+    @property
+    def isolation_level(self) -> str:
+        """Configured librdkafka ``isolation.level``.
+
+        Returns
+        -------
+        str
+            ``"read_uncommitted"`` or ``"read_committed"``.
+        """
+        return self._isolation_level
 
     def _build_deserializer(self) -> AvroDeserializer:
         """Construct the value :class:`AvroDeserializer`.
@@ -237,6 +256,7 @@ class AvroEventConsumer:
                 "group.id": self._group_id,
                 "auto.offset.reset": self._auto_offset_reset,
                 "enable.auto.commit": False,
+                "isolation.level": self._isolation_level,
                 "key.deserializer": StringDeserializer("utf_8"),
                 "value.deserializer": self._deserializer,
             }
@@ -330,6 +350,96 @@ class AvroEventConsumer:
         self._ensure_subscribed()
         messages = self._poll_messages(timeout_s, max_messages)
         return [msg.value() for msg in messages]
+
+    def subscribe(self) -> None:
+        """Subscribe to the configured topic (group-managed assignment).
+
+        Idempotent: the underlying ``subscribe`` call is issued exactly
+        once.  Partition assignment is performed lazily by the broker on
+        the first :meth:`poll_batch`.
+        """
+        self._ensure_subscribed()
+
+    def poll_batch(
+        self, timeout_s: float = 1.0, max_messages: int = 1024
+    ) -> list[Any]:
+        """Poll up to *max_messages* raw Kafka messages.
+
+        Unlike :meth:`consume`, this returns the raw ``Message`` objects so
+        the caller can read per-message metadata (``timestamp()``,
+        ``partition()``) and decide how to deserialize.  Used by
+        :class:`~streaming_feature_store.consume.consume_runner.ConsumeRunner`
+        to measure end-to-end latency.
+
+        Parameters
+        ----------
+        timeout_s : float, optional
+            Wall-clock budget for the poll loop.  Defaults to ``1.0``.
+        max_messages : int, optional
+            Maximum number of messages to collect.  Defaults to ``1024``.
+
+        Returns
+        -------
+        list of Message
+            Messages in delivery order (possibly empty).
+        """
+        self._ensure_subscribed()
+        return self._poll_messages(timeout_s, max_messages)
+
+    def commit(self) -> None:
+        """Synchronously commit the current consume position.
+
+        Notes
+        -----
+        ``enable.auto.commit`` is ``False``; the runner calls this once per
+        fully-processed batch so a crash / rebalance resumes from the last
+        *processed* offset (at-least-once read — design doc §2.3).
+        """
+        self._consumer.commit(asynchronous=False)
+
+    def assigned_partitions(self) -> list[int]:
+        """Return the partition numbers currently assigned to this member.
+
+        Returns
+        -------
+        list of int
+            Sorted partition ids; empty before the first poll / assignment.
+        """
+        return sorted(tp.partition for tp in self._consumer.assignment())
+
+    def consumer_lag(self) -> int:
+        """Return total lag = Σ ``(high_watermark − position)`` over assignment.
+
+        Returns
+        -------
+        int
+            Sum of per-partition lag across all assigned partitions.  ``0``
+            when no partitions are assigned yet or every position is still
+            invalid (no fetch has happened).  Never negative.
+
+        Notes
+        -----
+        Lag is the consumer's primary health metric (design doc §2.5): a
+        flat series means the group keeps up; a monotonically rising series
+        is the "consumer slower than producer" collapse.
+        """
+        assignment = self._consumer.assignment()
+        if not assignment:
+            return 0
+        positions = self._consumer.position(assignment)
+        pos_by_tp = {
+            (tp.topic, tp.partition): tp.offset for tp in positions
+        }
+        total = 0
+        for tp in assignment:
+            _, high = self._consumer.get_watermark_offsets(
+                tp, timeout=5.0, cached=False
+            )
+            pos = pos_by_tp.get((tp.topic, tp.partition), OFFSET_INVALID)
+            if pos is None or pos < 0 or high is None or high < 0:
+                continue
+            total += max(0, high - pos)
+        return total
 
     def close(self) -> None:
         """Close the underlying consumer.
