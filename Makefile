@@ -1,4 +1,5 @@
 COMPOSE_FILE := docker/docker-compose.yml
+PIDS_DIR := .pids
 
 .PHONY: infra-up infra-down infra-status infra-logs infra-clean \
         kafka-topics kafka-describe psql \
@@ -10,6 +11,7 @@ COMPOSE_FILE := docker/docker-compose.yml
         load-test load-test-quick load-test-report test-benchmark \
         load-test-mp load-test-mp-quick load-test-mp-report load-test-mp-eos \
         consume-test consume-test-mp consume-test-mp-quick consume-test-report \
+        sink-run feeder-run pipeline-up pipeline-down sink-report \
         test test-unit test-integration install
 
 # ---------------------------------------------------------------------------
@@ -176,3 +178,39 @@ consume-test-report:  ## Open the generated consume report
 	@xdg-open docs/results/week1_consume_results_mp.md 2>/dev/null \
 	  || open docs/results/week1_consume_results_mp.md 2>/dev/null \
 	  || echo "Report at docs/results/week1_consume_results_mp.md"
+
+# ---------------------------------------------------------------------------
+# Continuous pipeline (Week 1 — Kafka-to-Postgres sink + background feeder)
+# ---------------------------------------------------------------------------
+
+feeder-run:  ## Start the low-rate continuous feeder (200 evt/s default) in foreground
+	uv run python scripts/run_background_feeder.py
+
+sink-run:  ## Start the Kafka-to-Postgres sink consumer in foreground
+	uv run python scripts/run_postgres_sink.py
+
+pipeline-up:  ## Daemonize feeder + sink, write PIDs to $(PIDS_DIR)/
+	@mkdir -p $(PIDS_DIR)
+	@nohup uv run python scripts/run_background_feeder.py \
+	  > $(PIDS_DIR)/feeder.log 2>&1 & echo $$! > $(PIDS_DIR)/feeder.pid
+	@nohup uv run python scripts/run_postgres_sink.py \
+	  > $(PIDS_DIR)/sink.log 2>&1 & echo $$! > $(PIDS_DIR)/sink.pid
+	@echo "feeder PID: $$(cat $(PIDS_DIR)/feeder.pid)"
+	@echo "sink   PID: $$(cat $(PIDS_DIR)/sink.pid)"
+	@echo "logs in $(PIDS_DIR)/"
+
+pipeline-down:  ## SIGTERM feeder + sink and wait for graceful shutdown
+	@if [ -f $(PIDS_DIR)/feeder.pid ]; then \
+	  kill -TERM $$(cat $(PIDS_DIR)/feeder.pid) 2>/dev/null || true; \
+	  rm -f $(PIDS_DIR)/feeder.pid; \
+	fi
+	@if [ -f $(PIDS_DIR)/sink.pid ]; then \
+	  kill -TERM $$(cat $(PIDS_DIR)/sink.pid) 2>/dev/null || true; \
+	  rm -f $(PIDS_DIR)/sink.pid; \
+	fi
+	@echo "Sent SIGTERM to feeder + sink (allow ~10 s for clean shutdown)."
+
+sink-report:  ## Open the latest sink-run report
+	@xdg-open docs/results/week1_postgres_sink_results.md 2>/dev/null \
+	  || open docs/results/week1_postgres_sink_results.md 2>/dev/null \
+	  || echo "Report at docs/results/week1_postgres_sink_results.md"

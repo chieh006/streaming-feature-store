@@ -31,8 +31,29 @@ def test_generate_batch_seed_is_deterministic():
 def test_generate_batch_different_seed_diverges():
     a = SyntheticEventGenerator(seed=1).generate_batch(1024)
     b = SyntheticEventGenerator(seed=2).generate_batch(1024)
-    different = sum(1 for x, y in zip(a, b) if x.event_id != y.event_id)
+    # user_id is the seeded distributional draw, so different seeds must
+    # produce divergent user populations.  (event_id is OS-entropy and would
+    # always diverge regardless of seed — a weaker assertion.)
+    different = sum(1 for x, y in zip(a, b) if x.user_id != y.user_id)
     assert different / 1024 > 0.99
+
+
+def test_event_ids_within_batch_are_unique():
+    """Primary-key invariant: every event in a batch has a distinct event_id."""
+    events = SyntheticEventGenerator(seed=1).generate_batch(5000)
+    assert len({e.event_id for e in events}) == 5000
+
+
+def test_event_ids_are_non_deterministic_across_instances():
+    """event_id must use OS entropy, not the seeded RNG.
+
+    Two generators with the same seed must still emit disjoint event_id
+    sets — otherwise restarting the continuous feeder would re-emit the
+    prior run's UUIDs and every insert would hit ``ON CONFLICT DO NOTHING``.
+    """
+    a_ids = {e.event_id for e in SyntheticEventGenerator(seed=42).generate_batch(64)}
+    b_ids = {e.event_id for e in SyntheticEventGenerator(seed=42).generate_batch(64)}
+    assert a_ids.isdisjoint(b_ids)
 
 
 def test_event_type_distribution_matches_weights():

@@ -2,15 +2,20 @@
 
 The generator pre-allocates batches of N events using ``numpy`` vectorized
 random draws over a Zipfian user-id population, then materializes
-:class:`EcommerceEvent` instances just-in-time.  Determinism via a seeded
-``numpy.random.default_rng``.
+:class:`EcommerceEvent` instances just-in-time.  Distributional draws
+(``user_id``, ``event_type``, ``product_id``, ``quantity``, ``price``,
+``event_timestamp`` jitter) are seeded via ``numpy.random.default_rng`` for
+reproducibility, but ``event_id`` is drawn from OS entropy via
+:func:`uuid.uuid4` so that restarting the continuous feeder never re-emits
+the same primary keys (the ``raw_events`` table would otherwise collide on
+``ON CONFLICT (event_id) DO NOTHING`` for the entire prior run's sequence).
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from uuid import UUID
+from uuid import uuid4
 
 import numpy as np
 
@@ -177,8 +182,6 @@ class SyntheticEventGenerator:
             50,
             500_000,
         )
-        # Pre-generate UUID4 bytes vectorially.
-        uuid_bytes = self._rng.integers(0, 256, size=(n, 16), dtype=np.uint8)
         now_us = int(datetime.now(tz=timezone.utc).timestamp() * 1_000_000)
         # Spread timestamps over the past second so partitioning isn't degenerate.
         ts_us = now_us - self._rng.integers(0, 1_000_000, size=n, dtype=np.int64)
@@ -186,7 +189,8 @@ class SyntheticEventGenerator:
         events: list[EcommerceEvent] = []
         for i in range(n):
             event_type = _TYPE_ORDER[int(type_idx[i])]
-            event_id = UUID(bytes=bytes(uuid_bytes[i].tolist()), version=4)
+            # OS entropy (not seeded) so feeder restarts don't collide on PK.
+            event_id = uuid4()
             payload = self._make_payload(
                 event_type,
                 int(sku_idx[i]),
