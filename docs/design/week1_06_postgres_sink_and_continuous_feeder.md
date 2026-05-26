@@ -753,6 +753,13 @@ running services.
 make infra-up                  # PR #1: Kafka + Postgres + Registry
 make topic-ensure              # PR #4: ensures e-commerce-events
                                # (the feeder will ensure -feed itself)
+make register-schemas          # PR #2: registers e-commerce-events-value
+make register-schemas-feed     # registers e-commerce-events-feed-value
+                               # (required: the Avro serializer in the
+                               #  feeder looks up <topic>-value at
+                               #  produce time; the feed topic uses a
+                               #  distinct subject from the benchmark
+                               #  topic under TopicNameStrategy)
 ```
 
 ### 7.2 Start the continuous pipeline

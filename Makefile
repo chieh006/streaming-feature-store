@@ -4,7 +4,7 @@ PIDS_DIR := .pids
 .PHONY: infra-up infra-down infra-status infra-logs infra-clean \
         kafka-topics kafka-describe psql \
         schema-subjects schema-compat \
-        register-schemas register-schemas-dry produce-sample \
+        register-schemas register-schemas-dry register-schemas-feed produce-sample \
         schema-evolution schema-evolution-snapshot schema-evolution-clean \
         schema-evolution-report \
         topic-ensure topic-describe \
@@ -12,6 +12,8 @@ PIDS_DIR := .pids
         load-test-mp load-test-mp-quick load-test-mp-report load-test-mp-eos \
         consume-test consume-test-mp consume-test-mp-quick consume-test-report \
         sink-run feeder-run pipeline-up pipeline-down sink-report \
+        validator-run validator-run-mp validator-up validator-down \
+        validator-report \
         test test-unit test-integration install
 
 # ---------------------------------------------------------------------------
@@ -70,6 +72,9 @@ register-schemas:  ## Register all .avsc files under schemas/ with the Registry
 
 register-schemas-dry:  ## Show what would be registered without writing
 	uv run python scripts/register_schemas.py --dry-run
+
+register-schemas-feed:  ## Register the composite schema under 'e-commerce-events-feed-value' (required for the feeder / sink / validator)
+	uv run python scripts/register_schemas.py --subject e-commerce-events-feed-value
 
 print-schema:  ## Print the full assembled Avro schema JSON to stdout
 	uv run python scripts/register_schemas.py --print-schema
@@ -214,3 +219,46 @@ sink-report:  ## Open the latest sink-run report
 	@xdg-open docs/results/week1_postgres_sink_results.md 2>/dev/null \
 	  || open docs/results/week1_postgres_sink_results.md 2>/dev/null \
 	  || echo "Report at docs/results/week1_postgres_sink_results.md"
+
+# ---------------------------------------------------------------------------
+# Inline validator + DLQ router (Week 2 — validation stage)
+# ---------------------------------------------------------------------------
+
+validator-run:  ## Start the single-process validator daemon in foreground
+	uv run python scripts/run_validator.py
+
+validator-run-mp:  ## Start the multi-process validator consumer group (default 4 procs)
+	uv run python scripts/run_validator_mp.py
+
+validator-up:  ## Daemonize the validator alongside feeder + sink
+	@mkdir -p $(PIDS_DIR)
+	@nohup uv run python scripts/run_background_feeder.py \
+	  > $(PIDS_DIR)/feeder.log 2>&1 & echo $$! > $(PIDS_DIR)/feeder.pid
+	@nohup uv run python scripts/run_postgres_sink.py \
+	  > $(PIDS_DIR)/sink.log 2>&1 & echo $$! > $(PIDS_DIR)/sink.pid
+	@nohup uv run python scripts/run_validator.py \
+	  > $(PIDS_DIR)/validator.log 2>&1 & echo $$! > $(PIDS_DIR)/validator.pid
+	@echo "feeder    PID: $$(cat $(PIDS_DIR)/feeder.pid)"
+	@echo "sink      PID: $$(cat $(PIDS_DIR)/sink.pid)"
+	@echo "validator PID: $$(cat $(PIDS_DIR)/validator.pid)"
+	@echo "logs in $(PIDS_DIR)/"
+
+validator-down:  ## SIGTERM the validator + feeder + sink trio
+	@if [ -f $(PIDS_DIR)/validator.pid ]; then \
+	  kill -TERM $$(cat $(PIDS_DIR)/validator.pid) 2>/dev/null || true; \
+	  rm -f $(PIDS_DIR)/validator.pid; \
+	fi
+	@if [ -f $(PIDS_DIR)/feeder.pid ]; then \
+	  kill -TERM $$(cat $(PIDS_DIR)/feeder.pid) 2>/dev/null || true; \
+	  rm -f $(PIDS_DIR)/feeder.pid; \
+	fi
+	@if [ -f $(PIDS_DIR)/sink.pid ]; then \
+	  kill -TERM $$(cat $(PIDS_DIR)/sink.pid) 2>/dev/null || true; \
+	  rm -f $(PIDS_DIR)/sink.pid; \
+	fi
+	@echo "Sent SIGTERM to validator + feeder + sink (allow ~10 s for clean shutdown)."
+
+validator-report:  ## Open the latest validator-run report
+	@xdg-open docs/results/week2_validator_results.md 2>/dev/null \
+	  || open docs/results/week2_validator_results.md 2>/dev/null \
+	  || echo "Report at docs/results/week2_validator_results.md"

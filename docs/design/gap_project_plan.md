@@ -47,7 +47,7 @@
 
 - **Apache Kafka** — distributed event streaming
 - **Confluent Schema Registry** (or Apicurio) — schema management, compatibility enforcement, and schema evolution
-- **Apache Flink** (or Kafka Streams) — stream processing for feature computation
+- **Apache Flink** — stream processing for feature computation
 - **Redis** — online feature serving (low-latency key-value lookups)
 - **PostgreSQL or DuckDB** — offline feature storage and batch computation
 - **Feast** (open source) — feature store framework (study architecture, optionally integrate)
@@ -77,7 +77,7 @@ Build a feature store system that ingests raw events via Kafka with schema evolu
 
 **Week 2 — Validation & Feature Computation**
 - **Validation layer:** Implement an inline validation stage in the stream processor that checks incoming events for: null/missing required fields, out-of-range values (e.g., negative prices, timestamps in the future), malformed records, and schema conformance against the registry — route invalid events to a `dead-letter-queue` topic with error metadata for debugging
-- Implement stream processing using Kafka Streams or Flink to compute real-time features from validated events (fold any minor enrichment, e.g. timestamp normalization, into this step rather than as a separate transformation layer):
+- Implement stream processing using Flink to compute real-time features from validated events (fold any minor enrichment, e.g. timestamp normalization, into this step rather than as a separate transformation layer):
   - Sliding window aggregations (clicks in last 5 minutes, purchase count in last 24 hours) — the canonical streaming interview topic, invest the most time here
   - Session-based features (session duration, pages per session) — uniquely streaming (gap timeouts, session windows); skip if time-constrained
 - Write computed features to Redis for online serving
