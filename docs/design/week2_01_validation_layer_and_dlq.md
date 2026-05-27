@@ -2,7 +2,7 @@
 
 **Phase:** 1 — Real-Time Feature Store & Streaming Pipeline
 **Week:** 2 — Validation & Feature Computation
-**Scope:** First bulletpoint of Week 2 — Implement an **inline validation stage** in the stream processor that checks every incoming event for (a) null/missing required fields, (b) out-of-range values, (c) malformed records, and (d) schema conformance against the registry, and **routes invalid events to a `dead-letter-queue` topic** with structured error metadata for debugging — line 79 of `gap_project_plan.md`. Out of scope: feature computation (Week 2 PR #2), EOS transactional wrapping (Week 2 PR #3).
+**Scope:** First bulletpoint of Week 2 — Implement an **inline validation stage** in the stream processor that checks every incoming event for (a) null/missing required fields, (b) out-of-range values, (c) malformed records, and (d) schema conformance against the registry, and **routes invalid events to a `dead-letter-queue` topic** with structured error metadata for debugging — line 79 of `gap_project_plan.md`. Out of scope: feature computation (Week 2 PR #2 — sliding-window features), EOS transactional wrapping (Week 2 PR #3). Session-window features (line 82 of the gap plan) are deferred per the plan's "skip if time-constrained" marker.
 **Author:** Auto-generated design document
 **Date:** 2026-05-25
 
@@ -48,8 +48,9 @@ fail to deserialize against the registered schema (Avro
   timestamps in the future, quantity ≤ 0, unknown event types) — those
   values pass through to PostgreSQL and would silently poison Week 2's
   windowed feature computation.
-- There is no separate **`validated-events`** topic that Week 2 PR #2
-  (feature computation) can subscribe to with the contract *"every
+- There is no separate **`validated-events`** topic that the Week 2
+  feature-computation PRs (PR #2 — sliding windows; PR #3 — session
+  windows) can subscribe to with the contract *"every
   message you read here has already been schema- and value-checked."*
 
 This PR closes those three gaps:
@@ -65,8 +66,8 @@ This PR closes those three gaps:
   multi-process consumer-group escape hatch as PR #5 / PR #6) that
   consumes from `e-commerce-events-feed`, applies the pipeline, and
   *routes* each message to one of two output topics:
-  - `validated-events` for `Valid(...)` results — Week 2 PR #2 will read
-    from this topic;
+  - `validated-events` for `Valid(...)` results — Week 2 PR #2
+    (sliding-window features) will read from this topic;
   - `dead-letter-queue` for `Invalid(...)` results — Avro-serialized
     `DlqRecord` envelopes with the original raw bytes preserved for
     forensic replay.
@@ -84,10 +85,12 @@ generated Markdown run report.
 
 ### Out of Scope (Deferred to Later PRs)
 
-- **Stateful feature computation (windowed + session features).** Moved
-  to Week 2 PR #2 ([`gap_project_plan.md`](gap_project_plan.md) — Week 2
-  second bulletpoint). Validation is stateless on purpose; bundling
+- **Stateful feature computation (sliding-window aggregates).** Moved
+  to Week 2 PR #2 ([`gap_project_plan.md`](gap_project_plan.md)
+  lines 80–81). Validation is stateless on purpose; bundling
   windowing in here would conflate two distinct review concerns.
+  Session-window features (line 82) are deferred per the plan's
+  "skip if time-constrained" marker.
 - **EOS transactional wrapping of the consume-validate-produce cycle.**
   Moved to Week 2 PR #3 ([`gap_project_plan.md`](gap_project_plan.md) —
   Week 2 EOS bullet). The validator ships with the same
@@ -166,8 +169,8 @@ generated Markdown run report.
 **Decision:** Implement the validator as a **Python daemon on top of the
 existing `AvroEventConsumer` and `AvroEventProducer`**, with the
 multi-process consumer-group escape hatch from PR #5 for throughput
-scaling. Defer Flink/Kafka Streams to **Week 2 PR #2** (feature
-computation) where stateful processing is the actual driver.
+scaling. Defer Flink/Kafka Streams to **Week 2 PR #2** (sliding-window
+features) where stateful processing is the actual driver.
 
 **Rationale:**
 
@@ -195,10 +198,10 @@ computation) where stateful processing is the actual driver.
   the new code is the out-of-range validators and the DLQ routing.
 - **Pedagogical sequencing.** Each Week 2 PR introduces one new
   concept on top of Week 1: PR #1 introduces *DLQ routing*, PR #2
-  introduces *stateful streaming on Flink*, PR #3 introduces *Kafka
-  transactions*. Bundling Flink into PR #1 conflates "the data quality
-  pattern" with "the streaming engine choice" and weakens both
-  stories.
+  introduces *stateful streaming on Flink with sliding windows*,
+  PR #3 introduces *Kafka transactions (EOS)*. Bundling Flink into
+  PR #1 conflates "the data quality pattern" with "the streaming
+  engine choice" and weakens both stories.
 - **Acknowledged tradeoff.** A production validator on top of a
   high-throughput firehose (≫ feeder rate) would be implemented as a
   Flink `ProcessFunction` for backpressure-aware flow control and
@@ -319,8 +322,8 @@ e-commerce-events-feed  ──▶  Validator  ──▶  validated-events
 ```
 
 End-to-end, this PR's validator sits in the middle of the following
-fan-out — *parallel to* the Postgres sink, *upstream of* the Week 2 PR #2
-Flink feature processor:
+fan-out — *parallel to* the Postgres sink, *upstream of* the Week 2
+PR #2 Flink feature processor:
 
 ```
                                   ┌──▶ sink ──▶ raw_events (Postgres)         [forensic-complete]
@@ -341,8 +344,8 @@ consumer group (`validator-bench`) so the daily-flow validator
 - **Continuous flow → validated flow.** The continuous feeder
   ([`week1_06`](week1_06_postgres_sink_and_continuous_feeder.md) §2.4) is
   the steady-state source of truth for downstream processors. Feature
-  computation in PR #2 will read from `validated-events`, which is fed
-  from `e-commerce-events-feed` via this validator.
+  computation in PR #2 will read from `validated-events`, which is
+  fed from `e-commerce-events-feed` via this validator.
 - **Benchmark-mode isolation.** Validating a 10 s burst of ~60k evt/s
   on the *same* consumer group as the continuous validator would
   thrash partition assignment and contaminate the steady-state
@@ -482,9 +485,9 @@ ordering ([`week1_06`](week1_06_postgres_sink_and_continuous_feeder.md)
   twice — once before crash, once after restart-and-retry. Both
   consumers (`validated-events` and `dead-letter-queue`) tolerate
   this:
-  - `validated-events` consumer is the Week 2 PR #2 feature processor,
-    which keys its windowed state on `event_id` and will be designed
-    idempotent.
+  - `validated-events` consumer is the Week 2 PR #2 (sliding-window)
+    feature processor, which keys its windowed state on `event_id`
+    and will be designed idempotent.
   - `dead-letter-queue` consumers are forensic readers; they
     already have to handle replay/dedupe by source-offset key
     (above).
@@ -1231,8 +1234,8 @@ Constraints:
 ## 9. Future Considerations
 
 1. **Flink port of the validator.** A `ProcessFunction` doing the same
-   validation chain inside the Week 2 PR #2 Flink job would collapse
-   the two stream processors into one and avoid the
+   validation chain inside the Week 2 PR #2 (sliding) Flink job would
+   collapse the two stream processors into one and avoid the
    `validated-events` topic hop. The portfolio-narrative argument is
    that **the topic boundary is intentional for failure isolation
    (§2.2)**; collapsing it is a deliberate operational tradeoff. Worth
