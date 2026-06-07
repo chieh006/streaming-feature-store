@@ -1,0 +1,35 @@
+{
+  "type": "record",
+  "name": "SlidingFeatureRecord",
+  "namespace": "com.featurestore.sliding.v1",
+  "doc": "Per-(user_id, window, slide-tick) sliding-window feature record emitted by the Flink hopping-window job. Carries the union of features across all three resolutions; per-resolution slices populate only the applicable fields and leave the rest null (week2_02 §2.14).",
+  "fields": [
+    {"name": "user_id",            "type": "string",
+                                   "doc": "User identifier — matches the Kafka message key prefix."},
+    {"name": "window_resolution",  "type":
+                                     {"type": "enum",
+                                      "name": "WindowResolution",
+                                      "symbols": ["W_5M_SLIDE_1M",
+                                                  "W_1H_SLIDE_5M",
+                                                  "W_24H_SLIDE_1H"]},
+                                   "doc": "One of the three sliding resolutions. The symbol order is append-only under BACKWARD compatibility."},
+    {"name": "window_start_ms",    "type": "long",
+                                   "doc": "Inclusive lower bound of the window in milliseconds since the Unix epoch."},
+    {"name": "window_end_ms",      "type": "long",
+                                   "doc": "Exclusive upper bound of the window in milliseconds since the Unix epoch — also the stable per-window identifier for idempotency (week2_02 §2.9)."},
+    {"name": "emission_seq",       "type": "int", "default": 0,
+                                   "doc": "0 on first fire of a window; +1 per allowed-lateness re-fire."},
+    {"name": "click_count",        "type": ["null", "long"],   "default": null,
+                                   "doc": "Count of CLICK events in the window (5m, 1h resolutions only)."},
+    {"name": "page_view_count",    "type": ["null", "long"],   "default": null,
+                                   "doc": "Count of PAGE_VIEW events in the window (5m, 1h resolutions only)."},
+    {"name": "purchase_count",     "type": ["null", "long"],   "default": null,
+                                   "doc": "Count of PURCHASE events in the window (all three resolutions)."},
+    {"name": "revenue",            "type": ["null", "double"], "default": null,
+                                   "doc": "Sum of price_cents/100 x quantity for purchases (all three resolutions)."},
+    {"name": "distinct_products",  "type": ["null", "long"],   "default": null,
+                                   "doc": "Count-distinct of product_id seen in the window (1h, 24h resolutions only)."},
+    {"name": "avg_purchase_amount","type": ["null", "double"], "default": null,
+                                   "doc": "revenue / purchase_count or null when purchase_count == 0 (24h resolution only)."}
+  ]
+}

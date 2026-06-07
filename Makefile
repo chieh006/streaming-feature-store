@@ -14,6 +14,8 @@ PIDS_DIR := .pids
         sink-run feeder-run pipeline-up pipeline-down sink-report \
         validator-run validator-run-mp validator-up validator-down \
         validator-report \
+        redis-cli \
+        sliding-run sliding-run-group sliding-report sliding-redis-show \
         test test-unit test-integration install
 
 # ---------------------------------------------------------------------------
@@ -262,3 +264,28 @@ validator-report:  ## Open the latest validator-run report
 	@xdg-open docs/results/week2_validator_results.md 2>/dev/null \
 	  || open docs/results/week2_validator_results.md 2>/dev/null \
 	  || echo "Report at docs/results/week2_validator_results.md"
+
+# ---------------------------------------------------------------------------
+# Sliding-window features consumer (Week 2 PR #2)
+# Plain Python Kafka consumer with in-memory windowing — Flink was prototyped
+# and rejected; see docs/design/week2_02_sliding_window_features_plain_consumer.md
+# §2.1.  Redis is started by `make infra-up` along with the rest of the stack.
+# ---------------------------------------------------------------------------
+
+redis-cli:  ## Open an interactive redis-cli session against the running Redis
+	docker compose -f $(COMPOSE_FILE) exec redis redis-cli
+
+sliding-run:  ## Run the sliding-features consumer (single process, foreground)
+	uv run python scripts/run_sliding_features_consumer.py --redis-host localhost
+
+sliding-run-group:  ## Run a consumer group of N processes (default N=4): make sliding-run-group N=4
+	uv run python scripts/run_sliding_features_consumer.py --redis-host localhost --num-workers $(or $(N),4)
+
+sliding-report:  ## Open the latest sliding-features results report
+	@xdg-open docs/results/week2_sliding_features_results.md 2>/dev/null \
+	  || open docs/results/week2_sliding_features_results.md 2>/dev/null \
+	  || echo "Report at docs/results/week2_sliding_features_results.md"
+
+sliding-redis-show:  ## Dump a sample of the Redis feat:user:* hashes (10 keys)
+	@docker compose -f $(COMPOSE_FILE) exec redis sh -c \
+	  "redis-cli --scan --pattern 'feat:user:*' | head -10 | xargs -I {} sh -c 'echo \"=== {} ===\"; redis-cli HGETALL {}'"

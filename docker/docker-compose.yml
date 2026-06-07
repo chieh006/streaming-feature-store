@@ -13,6 +13,7 @@ volumes:
   kafka-2-data:
   kafka-3-data:
   postgres-data:
+  redis-data:
 
 x-kafka-common-env: &kafka-common-env
   CLUSTER_ID: "3bCfH63Tm2bFuFGE2D5UAw"
@@ -262,4 +263,43 @@ services:
       resources:
         limits:
           memory: 512M
+          cpus: "0.5"
+
+  # ---------------------------------------------------------------------------
+  # Redis 7 — online feature-store sink for the sliding-window consumer
+  # (week2_02_sliding_window_features_plain_consumer §2.8).  A single hash per
+  # user (``feat:user:{user_id}``) holds all 12 features across the 3
+  # resolutions with per-resolution TTLs.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.4-alpine
+    container_name: redis
+    hostname: redis
+    networks:
+      - feature-store-net
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command:
+      - redis-server
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - "256mb"
+      - --maxmemory-policy
+      - "noeviction"
+    healthcheck:
+      test:
+        - "CMD"
+        - "redis-cli"
+        - "ping"
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 320M
           cpus: "0.5"

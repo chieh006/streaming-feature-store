@@ -169,8 +169,12 @@ generated Markdown run report.
 **Decision:** Implement the validator as a **Python daemon on top of the
 existing `AvroEventConsumer` and `AvroEventProducer`**, with the
 multi-process consumer-group escape hatch from PR #5 for throughput
-scaling. Defer Flink/Kafka Streams to **Week 2 PR #2** (sliding-window
-features) where stateful processing is the actual driver.
+scaling. Defer stateful processing to **Week 2 PR #2** (sliding-window
+features) where it is the actual driver. *(Update 2026-06-07: PR #2
+ultimately also used a plain Python consumer rather than Flink — see
+[`week2_02_sliding_window_features_plain_consumer.md`](week2_02_sliding_window_features_plain_consumer.md)
+§2.1. The Python-vs-Flink comparison below still stands as this PR's
+rationale.)*
 
 **Rationale:**
 
@@ -198,7 +202,9 @@ features) where stateful processing is the actual driver.
   the new code is the out-of-range validators and the DLQ routing.
 - **Pedagogical sequencing.** Each Week 2 PR introduces one new
   concept on top of Week 1: PR #1 introduces *DLQ routing*, PR #2
-  introduces *stateful streaming on Flink with sliding windows*,
+  introduces *stateful streaming with sliding windows* (in a plain
+  Python consumer — Flink was prototyped and rejected at this scale,
+  see [`week2_02_sliding_window_features_plain_consumer.md`](week2_02_sliding_window_features_plain_consumer.md)),
   PR #3 introduces *Kafka transactions (EOS)*. Bundling Flink into
   PR #1 conflates "the data quality pattern" with "the streaming
   engine choice" and weakens both stories.
@@ -323,12 +329,12 @@ e-commerce-events-feed  ──▶  Validator  ──▶  validated-events
 
 End-to-end, this PR's validator sits in the middle of the following
 fan-out — *parallel to* the Postgres sink, *upstream of* the Week 2
-PR #2 Flink feature processor:
+PR #2 feature processor (a plain Python sliding-window consumer):
 
 ```
                                   ┌──▶ sink ──▶ raw_events (Postgres)         [forensic-complete]
 feeder ──▶ e-commerce-events-feed ┤
-                                  └──▶ Validator (this PR) ──┬──▶ validated-events ──▶ Flink FeatureProcessor ──▶ Redis (online store)
+                                  └──▶ Validator (this PR) ──┬──▶ validated-events ──▶ Sliding Consumer (Python) ──▶ Redis (online store)
                                                              │                              [Week 2 PR #2]            [Week 2 PR #2]
                                                              └──▶ dead-letter-queue ──▶ forensic / replay
 ```
@@ -626,8 +632,8 @@ both idempotent:
                  ▼                      ▼
    ┌──────────────────────┐   ┌──────────────────────┐
    │ Week 2 PR #2:        │   │ Forensic readers,    │
-   │ FeatureProcessor     │   │ §9 replay tooling    │
-   │ (Flink/KStreams)     │   │                      │
+   │ Sliding Consumer     │   │ §9 replay tooling    │
+   │ (plain Python)       │   │                      │
    └──────────────────────┘   └──────────────────────┘
 ```
 
@@ -1233,9 +1239,11 @@ Constraints:
 
 ## 9. Future Considerations
 
-1. **Flink port of the validator.** A `ProcessFunction` doing the same
-   validation chain inside the Week 2 PR #2 (sliding) Flink job would
-   collapse the two stream processors into one and avoid the
+1. **Fusing the validator into the feature processor.** Doing the same
+   validation chain inside the Week 2 PR #2 sliding consumer (now a plain
+   Python consumer, not Flink — see
+   [`week2_02_sliding_window_features_plain_consumer.md`](week2_02_sliding_window_features_plain_consumer.md))
+   would collapse the two stream processors into one and avoid the
    `validated-events` topic hop. The portfolio-narrative argument is
    that **the topic boundary is intentional for failure isolation
    (§2.2)**; collapsing it is a deliberate operational tradeoff. Worth

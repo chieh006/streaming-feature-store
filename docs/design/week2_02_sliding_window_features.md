@@ -1,5 +1,16 @@
 # Design Doc: Sliding-Window Feature Computation (Flink Hopping Windows)
 
+> ⚠️ **SUPERSEDED — DO NOT IMPLEMENT.** This PyFlink design did not pan out at
+> laptop scale: the JVM cluster + Apache Beam portability bridge + JAR
+> management + GIL-in-UDF cost made it operationally heavy and brittle (the
+> first smoke run failed on a Beam-worker Redis connection error before any
+> window emitted). It is **kept only as an interview/portfolio artifact** —
+> the windowing *semantics* documented here (pane-based pre-aggregation,
+> watermarks, allowed-lateness, the sink/idempotency contracts) are correct
+> and carry forward unchanged. The **active implementation** is a plain Python
+> Kafka consumer group with in-memory sliding windows:
+> [`week2_02_sliding_window_features_plain_consumer.md`](week2_02_sliding_window_features_plain_consumer.md).
+
 **Phase:** 1 — Real-Time Feature Store & Streaming Pipeline
 **Week:** 2 — Validation & Feature Computation
 **Scope:** First sub-bullet of the Week 2 feature-computation step in
@@ -1250,50 +1261,106 @@ make sliding-submit            # THIS PR: PyFlink job
 
 ### 7.3 Inspect
 
+> **Wait before inspecting.** The first 5-minute window emission only
+> fires after the watermark advances past a window-end + slide tick — so
+> expect ~5 min of event-time before any record lands. The 1 h window
+> takes ~1 h of event-time; the 24 h window takes ~24 h.  All commands
+> below assume the job is already running (§7.2).
+
+#### Step 1 — Confirm records are flowing into the output Kafka topic
+
+Check partition end-offsets first (cheap; tells you at a glance whether
+anything has been written). Any non-zero offset means emissions are
+reaching Kafka:
+
 ```
-kafkactl consume sliding-features      --from-beginning --max-messages 6
-kafkactl consume sliding-features-late --from-beginning --max-messages 5
+docker exec kafka-1 /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server kafka-1:9092 --topic sliding-features
+docker exec kafka-1 /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server kafka-1:9092 --topic sliding-features-late
 ```
 
-Online-store inspection — all three resolutions in one round trip:
+Then peek at a few records (Avro-encoded; binary-ish output is normal):
 
 ```
-docker compose -f docker/docker-compose.yml exec redis redis-cli \
-  HGETALL feat:user:user-00042
+docker exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka-1:9092 --topic sliding-features \
+  --from-beginning --max-messages 6
+docker exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka-1:9092 --topic sliding-features-late \
+  --from-beginning --max-messages 5
+```
+
+#### Step 2 — Online-store inspection (Redis)
+
+Discover a user that has actually been emitted (don't hardcode an id —
+pick one the running job has touched):
+
+```
+USER=$(docker exec redis redis-cli --scan --pattern "feat:user:*" | head -1)
+echo "$USER"
+# example output: feat:user:user-00042
+```
+
+Read all three resolutions in one round trip:
+
+```
+docker exec redis redis-cli HGETALL "$USER"
 # expected fields (subset):
 #   clicks_5m, page_views_5m, purchases_5m, revenue_5m,
 #   clicks_1h, page_views_1h, purchases_1h, revenue_1h, distinct_products_1h,
 #   purchases_24h, revenue_24h, distinct_products_24h, avg_purchase_amount_24h
 ```
 
-Per-resolution Kafka filtering:
+Per-resolution Kafka filtering for that specific user (the Kafka key is
+`{user_id}:{resolution.name}`):
 
 ```
-kafkactl consume sliding-features --from-beginning \
-  --filter "key=user-00042:5m" --max-messages 5
+USER_ID="${USER#feat:user:}"           # strip the "feat:user:" prefix
+docker exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka-1:9092 --topic sliding-features \
+  --from-beginning --max-messages 5 \
+  --property print.key=true --property key.separator=' | ' \
+  | grep "^${USER_ID}:W_5M_SLIDE_1M"
 ```
 
-Flink web UI (per-operator backpressure, watermark, checkpoint sizes):
-`http://localhost:8081`.
+#### Step 3 — Flink web UI (optional)
+
+`http://localhost:8082` reaches the Docker JobManager (per
+[docker-compose.yml:320](../../docker/docker-compose.yml#L320), external
+8082 maps to the JM's internal 8081).  Use the UI for per-operator
+backpressure / watermark / checkpoint-size panels.
+
+> **Caveat:** the current
+> [`_build_execution_environment`](../../scripts/run_sliding_features_job.py)
+> returns a local minicluster environment for *both* branches, so the
+> running job is *in-process inside the Python script* and the Docker
+> JobManager's UI will report an empty job list.  To make the UI useful
+> the script needs a `RemoteStreamEnvironment(host, port)` for the
+> non-`--local` path (recorded as a §9 follow-up).
 
 #### Sanity check #1 — Are the three resolutions firing at the expected cadences?
 
 ```
-kafkactl consume sliding-features --from-beginning \
-  --filter "key=user-00042:5m" --max-messages 10 \
-  --print-headers --print-timestamp
+USER_ID="${USER#feat:user:}"
+docker exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka-1:9092 --topic sliding-features \
+  --from-beginning --max-messages 30 \
+  --property print.key=true --property print.timestamp=true \
+  --property key.separator=' | ' \
+  | grep "${USER_ID}:W_5M_SLIDE_1M"
 ```
 
-You should see records at approximately 1-minute timestamp intervals
-(one per slide tick). For `:1h` the cadence is 5 min; for `:24h` it is
-1 h. A cadence noticeably slower than expected indicates a stuck
-watermark (see §7.4).
+Records for the `5m` resolution should appear at approximately 1-minute
+timestamp intervals (one per slide tick).  For `1h` the cadence is
+5 min; for `24h` it is 1 h.  A cadence noticeably slower than expected
+indicates a stuck watermark (see §7.4).
 
 #### Sanity check #2 — Is the Redis hash actually populated for every active user?
 
 ```
-docker compose -f docker/docker-compose.yml exec redis redis-cli \
-  --scan --pattern "feat:user:*" | head -20
+docker exec redis redis-cli --scan --pattern "feat:user:*" | wc -l
+docker exec redis redis-cli --scan --pattern "feat:user:*" | head -20
 ```
 
 The number of returned keys should be roughly equal to the count of
@@ -1307,7 +1374,13 @@ are not firing.
 Flink web UI → Job → Watermarks. All three windowed operators should
 report a watermark within ~5 s of wall-clock time. A growing
 "watermark lag" on any operator stops all downstream emissions for
-that resolution.
+that resolution. *(See the Step 3 caveat above — only meaningful once
+the script submits to the remote JobManager rather than a local
+minicluster.)*  As a local-minicluster substitute, watch the
+`Retrieving state N times costed M seconds` warnings in
+`.venv/lib/python3.12/site-packages/pyflink/log/flink-*.log`: if the
+state-retrieval count keeps climbing but no records appear in Redis
+within the first 5–10 min of event-time, the watermark is the suspect.
 
 ### 7.4 CLI
 

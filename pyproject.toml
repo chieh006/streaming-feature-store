@@ -22,10 +22,20 @@ kafka = [
 postgres = [
     "psycopg[binary]>=3.1",
 ]
+# Sliding-window features consumer (Week 2 PR #2).  Plain Python Kafka
+# consumer + in-memory windowing — Flink/PyFlink was prototyped and rejected;
+# see docs/design/week2_02_sliding_window_features_plain_consumer.md §2.1.
+sliding = [
+    "confluent-kafka[avro,schemaregistry]>=2.4",
+    "fastavro>=1.9",
+    "redis>=5.0",
+    "pyarrow>=16",
+]
 test = [
     "confluent-kafka[avro,schemaregistry]>=2.4",
     "fastavro>=1.9",
     "psycopg[binary]>=3.1",
+    "redis>=5.0",
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "requests>=2.31",
