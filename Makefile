@@ -276,10 +276,14 @@ redis-cli:  ## Open an interactive redis-cli session against the running Redis
 	docker compose -f $(COMPOSE_FILE) exec redis redis-cli
 
 sliding-run:  ## Run the sliding-features consumer (single process, foreground)
-	uv run python scripts/run_sliding_features_consumer.py --redis-host localhost
+	uv run python scripts/run_sliding_features_consumer.py --redis-host localhost \
+		--bootstrap localhost:19092,localhost:19093,localhost:19094 \
+		--registry http://localhost:8081
 
 sliding-run-group:  ## Run a consumer group of N processes (default N=4): make sliding-run-group N=4
-	uv run python scripts/run_sliding_features_consumer.py --redis-host localhost --num-workers $(or $(N),4)
+	uv run python scripts/run_sliding_features_consumer.py --redis-host localhost \
+		--bootstrap localhost:19092,localhost:19093,localhost:19094 \
+		--registry http://localhost:8081 --num-workers $(or $(N),4)
 
 sliding-report:  ## Open the latest sliding-features results report
 	@xdg-open docs/results/week2_sliding_features_results.md 2>/dev/null \

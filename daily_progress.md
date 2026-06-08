@@ -5,8 +5,9 @@
 ### Progress
 - Removed Flink, not work reliably. 
 - Created a new design doc to replace Flink `week2_02_sliding_window_features_plain_consumer.md`.
-- *TODO*: Execute `week2_02_sliding_window_features_plain_consumer.md`.
-
+- Execute `week2_02_sliding_window_features_plain_consumer.md`.
+- Verify `week2_02_sliding_window_features_plain_consumer.md`.
+- *TODO*: Create Hashnode post `week2_02_sliding_window_features_plain_consumer.md`.
 
 ## 2026-05-27
 ### Progress

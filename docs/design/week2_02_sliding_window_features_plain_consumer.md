@@ -761,7 +761,9 @@ running services.
 ```
 make infra-up                  # Kafka + Postgres + Registry + Redis
 make topic-ensure              # e-commerce-events, -feed, validated-events
-                               # sliding-features* + schema auto-created on start
+make register-schemas-feed     # e-commerce-events-feed-value (feeder needs this)
+                               # validated-events* / sliding-features* schemas
+                               # self-register when each stage starts
 ```
 
 ### 7.2 Start the pipeline
