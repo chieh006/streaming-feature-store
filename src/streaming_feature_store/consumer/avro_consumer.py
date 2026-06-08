@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any
 from uuid import UUID
@@ -86,8 +86,8 @@ def _coerce_timestamp(value: Any) -> datetime:
         UTC-aware datetime.
     """
     if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-    return datetime.fromtimestamp(int(value) / 1_000_000, tz=timezone.utc)
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return datetime.fromtimestamp(int(value) / 1_000_000, tz=UTC)
 
 
 def _build_payload(d: dict) -> ClickPayload | PurchasePayload | PageViewPayload:
@@ -165,6 +165,13 @@ class AvroEventConsumer:
         seam for the deferred read-side EOS PR; against the default
         non-transactional producer it only adds last-stable-offset wait and
         is otherwise inert (see design doc §2.7).
+    group_instance_id : str or None, optional
+        librdkafka ``group.instance.id``.  When set, the consumer joins as a
+        **static member**: on restart within ``session.timeout.ms`` it reclaims
+        its previous partition assignment without triggering a rebalance,
+        keeping the EOS ``transactional.id`` ⇄ partition mapping stable across
+        restarts (design week2_03 §2.3 / §10.1).  Must be unique per live
+        member of the group.  ``None`` (default) leaves membership dynamic.
     """
 
     def __init__(
@@ -176,6 +183,7 @@ class AvroEventConsumer:
         reader_schema_str: str | None = None,
         auto_offset_reset: str = "earliest",
         isolation_level: str = "read_uncommitted",
+        group_instance_id: str | None = None,
     ) -> None:
         self._kafka_config = kafka_config
         self._registry_config = registry_config
@@ -183,6 +191,7 @@ class AvroEventConsumer:
         self._group_id = group_id
         self._auto_offset_reset = auto_offset_reset
         self._isolation_level = isolation_level
+        self._group_instance_id = group_instance_id
         self._reader_schema_str = reader_schema_str
         self._registry = SchemaRegistry(registry_config)
         self._deserializer = self._build_deserializer()
@@ -249,18 +258,19 @@ class AvroEventConsumer:
             Kafka consumer with string key deserialization and Avro value
             deserialization.
         """
-        return DeserializingConsumer(
-            {
-                "bootstrap.servers": self._kafka_config.bootstrap_servers,
-                "security.protocol": self._kafka_config.security_protocol,
-                "group.id": self._group_id,
-                "auto.offset.reset": self._auto_offset_reset,
-                "enable.auto.commit": False,
-                "isolation.level": self._isolation_level,
-                "key.deserializer": StringDeserializer("utf_8"),
-                "value.deserializer": self._deserializer,
-            }
-        )
+        conf: dict[str, object] = {
+            "bootstrap.servers": self._kafka_config.bootstrap_servers,
+            "security.protocol": self._kafka_config.security_protocol,
+            "group.id": self._group_id,
+            "auto.offset.reset": self._auto_offset_reset,
+            "enable.auto.commit": False,
+            "isolation.level": self._isolation_level,
+            "key.deserializer": StringDeserializer("utf_8"),
+            "value.deserializer": self._deserializer,
+        }
+        if self._group_instance_id is not None:
+            conf["group.instance.id"] = self._group_instance_id
+        return DeserializingConsumer(conf)
 
     def _ensure_subscribed(self) -> None:
         """Subscribe to the configured topic exactly once.
@@ -407,6 +417,47 @@ class AvroEventConsumer:
         """
         return sorted(tp.partition for tp in self._consumer.assignment())
 
+    def assignment(self) -> list[Any]:
+        """Return the raw ``TopicPartition`` list currently assigned.
+
+        Returns
+        -------
+        list of TopicPartition
+            The assignment as returned by librdkafka; empty before the first
+            poll / assignment.  Needed to bind offsets into a transaction
+            (design week2_03 §2.4 / §4.4).
+        """
+        return self._consumer.assignment()
+
+    def position(self, partitions: list[Any]) -> list[Any]:
+        """Return the current consume positions for *partitions*.
+
+        Parameters
+        ----------
+        partitions : list of TopicPartition
+            Partitions to query (typically :meth:`assignment`).
+
+        Returns
+        -------
+        list of TopicPartition
+            Each carries the next offset to be consumed — the offsets a
+            transactional producer binds via
+            ``send_offsets_to_transaction`` (design week2_03 §4.4).
+        """
+        return self._consumer.position(partitions)
+
+    def consumer_group_metadata(self) -> Any:
+        """Return the opaque consumer-group metadata for transactional commits.
+
+        Returns
+        -------
+        object
+            Group metadata required by
+            ``producer.send_offsets_to_transaction`` so the offset commit
+            joins the producer's transaction (design week2_03 §2.4 / §4.4).
+        """
+        return self._consumer.consumer_group_metadata()
+
     def consumer_lag(self) -> int:
         """Return total lag = Σ ``(high_watermark − position)`` over assignment.
 
@@ -451,7 +502,7 @@ class AvroEventConsumer:
         self._consumer.close()
         self._closed = True
 
-    def __enter__(self) -> "AvroEventConsumer":
+    def __enter__(self) -> AvroEventConsumer:
         """Return ``self`` for use as a context manager."""
         return self
 

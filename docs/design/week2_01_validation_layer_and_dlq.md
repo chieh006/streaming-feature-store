@@ -2,7 +2,7 @@
 
 **Phase:** 1 — Real-Time Feature Store & Streaming Pipeline
 **Week:** 2 — Validation & Feature Computation
-**Scope:** First bulletpoint of Week 2 — Implement an **inline validation stage** in the stream processor that checks every incoming event for (a) null/missing required fields, (b) out-of-range values, (c) malformed records, and (d) schema conformance against the registry, and **routes invalid events to a `dead-letter-queue` topic** with structured error metadata for debugging — line 79 of `gap_project_plan.md`. Out of scope: feature computation (Week 2 PR #2 — sliding-window features), EOS transactional wrapping (Week 2 PR #3). Session-window features (line 82 of the gap plan) are deferred per the plan's "skip if time-constrained" marker.
+**Scope:** First bulletpoint of Week 2 — Implement an **inline validation stage** in the stream processor that checks every incoming event for (a) null/missing required fields, (b) out-of-range values, (c) malformed records, and (d) schema conformance against the registry, and **routes invalid events to a `dead-letter-queue` topic** with structured error metadata for debugging — line 79 of `gap_project_plan.md`. Out of scope: feature computation (Week 2 PR #2 — sliding-window features), EOS transactional wrapping (Week 2 PR #3 — [`week2_03_exactly_once_transactions.md`](week2_03_exactly_once_transactions.md)). Session-window features (line 82 of the gap plan) are deferred per the plan's "skip if time-constrained" marker.
 **Author:** Auto-generated design document
 **Date:** 2026-05-25
 
@@ -92,8 +92,10 @@ generated Markdown run report.
   Session-window features (line 82) are deferred per the plan's
   "skip if time-constrained" marker.
 - **EOS transactional wrapping of the consume-validate-produce cycle.**
-  Moved to Week 2 PR #3 ([`gap_project_plan.md`](gap_project_plan.md) —
-  Week 2 EOS bullet). The validator ships with the same
+  Moved to Week 2 PR #3 — design doc
+  [`week2_03_exactly_once_transactions.md`](week2_03_exactly_once_transactions.md)
+  ([`gap_project_plan.md`](gap_project_plan.md) — Week 2 EOS bullet). The
+  validator ships with the same
   at-least-once-read + idempotent-write contract as the sink (idempotency
   keyed on `event_id` UUID for `validated-events`; idempotency keyed on
   `(original_topic, original_partition, original_offset)` for the DLQ —

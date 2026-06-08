@@ -1,6 +1,7 @@
 """Pydantic configuration models for Kafka, PostgreSQL, and Schema Registry."""
 
 import logging
+
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings
 
@@ -147,6 +148,15 @@ class ProducerTuning(BaseSettings):
             "max.in.flight=5 (load-test default False = throughput profile)"
         ),
     )
+    transactional_id: str | None = Field(
+        default=None,
+        description=(
+            "EOS transactional.id (design week2_03 §2.3). When set, emits "
+            "transactional.id and forces the idempotent foundation a "
+            "transactional producer requires (enable.idempotence=true, "
+            "acks=all, max.in.flight<=5). Default None = no transaction."
+        ),
+    )
 
     model_config = {"env_prefix": "KAFKA_PRODUCER_"}
 
@@ -160,6 +170,8 @@ class ProducerTuning(BaseSettings):
             :class:`SerializingProducer` config dict.  When
             ``enable_idempotence`` is ``True`` the returned mapping also
             carries the three EOS keys and ``acks`` is forced to ``"all"``.
+            When ``transactional_id`` is set it additionally carries
+            ``transactional.id`` and forces the same idempotent foundation.
         """
         conf: dict[str, object] = {
             "linger.ms": self.linger_ms,
@@ -173,6 +185,14 @@ class ProducerTuning(BaseSettings):
             # librdkafka rejects enable.idempotence unless acks=all and
             # max.in.flight.requests.per.connection <= 5, so both are forced
             # here regardless of the configured `acks`.
+            conf["enable.idempotence"] = True
+            conf["acks"] = "all"
+            conf["max.in.flight.requests.per.connection"] = 5
+        if self.transactional_id is not None:
+            # A transactional producer is built on the idempotent foundation,
+            # so force the same three keys even if `enable_idempotence` is
+            # False (design week2_03 §2.3).
+            conf["transactional.id"] = self.transactional_id
             conf["enable.idempotence"] = True
             conf["acks"] = "all"
             conf["max.in.flight.requests.per.connection"] = 5

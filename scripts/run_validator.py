@@ -20,7 +20,14 @@ from streaming_feature_store.config import (
     SchemaRegistryConfig,
 )
 from streaming_feature_store.consumer.avro_consumer import AvroEventConsumer
-from streaming_feature_store.producer.avro_producer import AvroEventProducer
+from streaming_feature_store.eos import (
+    CommitStrategy,
+    TransactionalConfig,
+    derive_transactional_id,
+)
+from streaming_feature_store.producer.avro_producer import (
+    AvroEventProducer,
+)
 from streaming_feature_store.schemas import (
     SCHEMAS_ROOT,
     SchemaRegistry,
@@ -29,6 +36,7 @@ from streaming_feature_store.schemas import (
 )
 from streaming_feature_store.validate.accountant import ValidatorAccountant
 from streaming_feature_store.validate.dlq import DlqProducer
+from streaming_feature_store.validate.eos_wiring import build_validator_eos
 from streaming_feature_store.validate.pipeline import (
     ValidationPipeline,
     default_validators,
@@ -121,6 +129,30 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--report-path", type=Path, default=_DEFAULT_REPORT_PATH)
     parser.add_argument("--validator-version", default="1.0.0")
+    parser.add_argument(
+        "--eos",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable transactional exactly-once: route validated-events + DLQ "
+            "writes and the input-offset commit through one transaction "
+            "(design week2_03)."
+        ),
+    )
+    parser.add_argument(
+        "--transactional-id",
+        dest="transactional_id",
+        default=None,
+        help="Producer transactional.id (default: f'{group_id}-0').",
+    )
+    parser.add_argument(
+        "--group-instance-id",
+        dest="group_instance_id",
+        default=None,
+        help="Static-membership group.instance.id (default: the txn id).",
+    )
+    parser.add_argument("--transaction-timeout-ms", type=int, default=60_000)
+    parser.add_argument("--commit-timeout-s", type=float, default=30.0)
     return parser
 
 
@@ -266,6 +298,85 @@ def _ensure_validated_schema_registered(
     return schema_id
 
 
+def _resolve_txn_config(
+    args: argparse.Namespace, group_id: str
+) -> TransactionalConfig | None:
+    """Resolve the EOS transactional config for this run, or ``None``.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments.
+    group_id : str
+        Consumer group id (drives the default transactional id).
+
+    Returns
+    -------
+    TransactionalConfig or None
+        The EOS config when ``--eos`` is set — the ``transactional.id`` defaults
+        to ``f"{group_id}-0"`` and the static-membership ``group.instance.id``
+        defaults to the same value — else ``None``.
+    """
+    if not args.eos:
+        return None
+    txn_id = args.transactional_id or derive_transactional_id(group_id, 0)
+    return TransactionalConfig(
+        enabled=True,
+        transactional_id=txn_id,
+        group_instance_id=args.group_instance_id or txn_id,
+        transaction_timeout_ms=args.transaction_timeout_ms,
+        commit_timeout_s=args.commit_timeout_s,
+    )
+
+
+def _build_producers_and_strategy(
+    kafka_config: KafkaConfig,
+    registry_config: SchemaRegistryConfig,
+    config: ValidatorRunConfig,
+    txn_config: TransactionalConfig | None,
+) -> tuple[object, object, CommitStrategy | None]:
+    """Build the route producers and the commit strategy for this run.
+
+    Returns the two standalone producers + ``None`` strategy for the default
+    at-least-once path, or two adapters over a single transactional producer +
+    a :class:`TransactionalCommit` when *txn_config* is set (design §2.2 / §2.4).
+
+    Parameters
+    ----------
+    kafka_config : KafkaConfig
+        Bootstrap configuration.
+    registry_config : SchemaRegistryConfig
+        Schema Registry connection settings.
+    config : ValidatorRunConfig
+        Resolved run configuration (topic names).
+    txn_config : TransactionalConfig or None
+        EOS config from :func:`_resolve_txn_config`; ``None`` selects the
+        at-least-once path.
+
+    Returns
+    -------
+    tuple
+        ``(validated_producer, dlq_producer, commit_strategy)``.
+    """
+    if txn_config is None:
+        validated_producer = AvroEventProducer(
+            kafka_config, registry_config, topic=config.validated_topic
+        )
+        dlq_producer = DlqProducer(
+            kafka_config, registry_config, topic=config.dlq_topic
+        )
+        return validated_producer, dlq_producer, None
+
+    logger.info(f"EOS enabled: transactional.id={txn_config.transactional_id!r}")
+    return build_validator_eos(
+        kafka_config,
+        registry_config,
+        validated_topic=config.validated_topic,
+        dlq_topic=config.dlq_topic,
+        txn_config=txn_config,
+    )
+
+
 def _install_signal_handlers(runner: ValidatorRunner) -> None:
     """Install ``SIGTERM`` / ``SIGINT`` handlers that request shutdown.
 
@@ -322,21 +433,18 @@ def _run(args: argparse.Namespace) -> int:
         poll_max_records=args.poll_max_records,
         flush_timeout_s=args.flush_timeout_s,
     )
+    txn_config = _resolve_txn_config(args, group_id)
     consumer = AvroEventConsumer(
         kafka_config,
         registry_config,
         group_id=config.consumer_group_id,
         topic=config.source_topic,
+        group_instance_id=txn_config.group_instance_id if txn_config else None,
     )
-    validated_producer = AvroEventProducer(
-        kafka_config,
-        registry_config,
-        topic=config.validated_topic,
-    )
-    dlq_producer = DlqProducer(
-        kafka_config,
-        registry_config,
-        topic=config.dlq_topic,
+    validated_producer, dlq_producer, commit_strategy = (
+        _build_producers_and_strategy(
+            kafka_config, registry_config, config, txn_config
+        )
     )
     pipeline = ValidationPipeline(default_validators())
     accountant = ValidatorAccountant()
@@ -347,6 +455,7 @@ def _run(args: argparse.Namespace) -> int:
         pipeline=pipeline,
         accountant=accountant,
         config=config,
+        commit_strategy=commit_strategy,
         validator_version=args.validator_version,
     )
     _install_signal_handlers(runner)

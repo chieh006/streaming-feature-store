@@ -13,9 +13,9 @@ PIDS_DIR := .pids
         consume-test consume-test-mp consume-test-mp-quick consume-test-report \
         sink-run feeder-run pipeline-up pipeline-down sink-report \
         validator-run validator-run-mp validator-up validator-down \
-        validator-report \
+        validator-report validator-run-eos validator-run-mp-eos eos-verify eos-report \
         redis-cli \
-        sliding-run sliding-run-group sliding-report sliding-redis-show \
+        sliding-run sliding-run-group sliding-run-eos sliding-report sliding-redis-show \
         test test-unit test-integration install
 
 # ---------------------------------------------------------------------------
@@ -266,6 +266,34 @@ validator-report:  ## Open the latest validator-run report
 	  || echo "Report at docs/results/week2_validator_results.md"
 
 # ---------------------------------------------------------------------------
+# Exactly-once semantics — transactional consume-process-produce (Week 2 PR #3)
+# See docs/design/week2_03_exactly_once_transactions.md
+# ---------------------------------------------------------------------------
+
+validator-run-eos:  ## Run the validator with transactional EOS (validated+dlq+offsets atomic)
+	uv run python scripts/run_validator.py --eos \
+		--bootstrap localhost:19092,localhost:19093,localhost:19094 \
+		--registry http://localhost:8081 \
+		--report-path docs/results/week2_eos_results.md
+
+validator-run-mp-eos:  ## Run the multi-process validator with EOS (per-member transactional.id)
+	uv run python scripts/run_validator_mp.py --eos \
+		--bootstrap localhost:19092,localhost:19093,localhost:19094 \
+		--registry http://localhost:8081
+
+eos-verify:  ## Read validated-events at read_committed (only committed, non-aborted records)
+	docker compose -f $(COMPOSE_FILE) exec kafka-1 \
+	  /opt/kafka/bin/kafka-console-consumer.sh \
+	  --bootstrap-server kafka-1:9092 --topic validated-events \
+	  --from-beginning --timeout-ms 5000 --isolation-level read_committed \
+	  --property print.key=true --property key.separator=' | '
+
+eos-report:  ## Open the latest EOS validator-run report
+	@xdg-open docs/results/week2_eos_results.md 2>/dev/null \
+	  || open docs/results/week2_eos_results.md 2>/dev/null \
+	  || echo "Report at docs/results/week2_eos_results.md"
+
+# ---------------------------------------------------------------------------
 # Sliding-window features consumer (Week 2 PR #2)
 # Plain Python Kafka consumer with in-memory windowing — Flink was prototyped
 # and rejected; see docs/design/week2_02_sliding_window_features_plain_consumer.md
@@ -284,6 +312,11 @@ sliding-run-group:  ## Run a consumer group of N processes (default N=4): make s
 	uv run python scripts/run_sliding_features_consumer.py --redis-host localhost \
 		--bootstrap localhost:19092,localhost:19093,localhost:19094 \
 		--registry http://localhost:8081 --num-workers $(or $(N),4)
+
+sliding-run-eos:  ## Run the sliding consumer with transactional EOS (features+late+offsets atomic)
+	uv run python scripts/run_sliding_features_consumer.py --eos --redis-host localhost \
+		--bootstrap localhost:19092,localhost:19093,localhost:19094 \
+		--registry http://localhost:8081
 
 sliding-report:  ## Open the latest sliding-features results report
 	@xdg-open docs/results/week2_sliding_features_results.md 2>/dev/null \

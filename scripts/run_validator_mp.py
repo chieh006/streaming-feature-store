@@ -139,6 +139,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default="INFO",
         help="Python logging level used by each child process.",
     )
+    parser.add_argument(
+        "--eos",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable transactional exactly-once for every member.  Each member "
+            "process gets its own transactional.id derived from the group id + "
+            "its index (design week2_03 §2.3): N members = N transaction scopes."
+        ),
+    )
+    parser.add_argument("--transaction-timeout-ms", type=int, default=60_000)
+    parser.add_argument("--commit-timeout-s", type=float, default=30.0)
     return parser
 
 
@@ -390,6 +402,9 @@ def _run(args: argparse.Namespace) -> int:
         mp_config,
         validator_version=args.validator_version,
         child_log_level=args.child_log_level,
+        eos=args.eos,
+        transaction_timeout_ms=args.transaction_timeout_ms,
+        commit_timeout_s=args.commit_timeout_s,
     )
     report = runner.run()
 

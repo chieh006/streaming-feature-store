@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -126,8 +126,8 @@ def test_install_signal_handlers_requests_shutdown(cli) -> None:
 
 
 def test_render_report_includes_counters(cli) -> None:
-    started = datetime(2026, 6, 7, 12, 0, tzinfo=timezone.utc)
-    ended = datetime(2026, 6, 7, 12, 1, tzinfo=timezone.utc)
+    started = datetime(2026, 6, 7, 12, 0, tzinfo=UTC)
+    ended = datetime(2026, 6, 7, 12, 1, tzinfo=UTC)
     report = cli.render_report(_snapshot(), SlidingConsumerConfig(), started, ended)
     assert "Events consumed: 10" in report
     assert "| 5m | 5 |" in report
@@ -141,32 +141,38 @@ def test_render_report_includes_counters(cli) -> None:
 
 def test_run_single_writes_report(cli, tmp_path) -> None:
     report_path = tmp_path / "report.md"
+    args = cli._build_parser().parse_args(["--report-path", str(report_path)])
+    config = SlidingConsumerConfig()
     fake_consumer = MagicMock()
     fake_consumer.run.return_value = _snapshot()
     with (
         patch.object(cli, "SlidingFeaturesConsumer", return_value=fake_consumer),
         patch.object(cli, "_install_signal_handlers"),
     ):
-        rc = cli._run_single(SlidingConsumerConfig(), report_path)
+        rc = cli._run_single(
+            args, config, cli._kafka_config(config), cli._registry_config(config)
+        )
     assert rc == 0
     assert "Sliding-Window Features Smoke Run" in report_path.read_text()
 
 
 def test_worker_entry_runs_consumer(cli) -> None:
+    args = cli._build_parser().parse_args([])
     fake_consumer = MagicMock()
     with (
         patch.object(cli, "SlidingFeaturesConsumer", return_value=fake_consumer) as cls,
         patch.object(cli, "_install_signal_handlers"),
     ):
-        cli._worker_entry(SlidingConsumerConfig())
+        cli._worker_entry(args, SlidingConsumerConfig(), 0)
     cls.assert_called_once()
     fake_consumer.run.assert_called_once()
 
 
 def test_run_group_starts_and_joins_workers(cli) -> None:
+    args = cli._build_parser().parse_args([])
     config = SlidingConsumerConfig(num_workers=3)
     with patch.object(cli.multiprocessing, "Process") as proc_cls:
-        rc = cli._run_group(config)
+        rc = cli._run_group(args, config)
     assert rc == 0
     assert proc_cls.call_count == 3
     assert proc_cls.return_value.start.call_count == 3

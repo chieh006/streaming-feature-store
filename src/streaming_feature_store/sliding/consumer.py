@@ -20,7 +20,7 @@ import threading
 import time
 from collections.abc import Callable
 
-from confluent_kafka import Consumer, Message, TopicPartition
+from confluent_kafka import Consumer, KafkaException, Message, TopicPartition
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import MessageField, SerializationContext
 from pydantic import BaseModel, ConfigDict
@@ -29,6 +29,11 @@ from streaming_feature_store.config import KafkaConfig, SchemaRegistryConfig
 from streaming_feature_store.consumer.avro_consumer import (
     _passthrough_from_dict,
     avro_dict_to_event,
+)
+from streaming_feature_store.eos import (
+    TransactionalAvroProducer,
+    TransactionalConfig,
+    requires_abort,
 )
 from streaming_feature_store.schemas import SchemaRegistry
 from streaming_feature_store.sliding.models import (
@@ -49,6 +54,10 @@ logger = logging.getLogger(__name__)
 # Event-time lookback used to rebuild 5 m / 1 h pane state on assignment; the
 # 1 h window subsumes the 5 m one, and 24 h warms over wall-clock (design §2.10).
 _WARMUP_LOOKBACK_MS: int = WindowResolution.W_1H_SLIDE_5M.window_size_ms
+
+# Per-transaction poll-batch cap under EOS (design week2_03 §2.7 — one
+# transaction per poll-batch, never per message).
+_EOS_MAX_RECORDS: int = 500
 
 
 def _now_ms() -> int:
@@ -107,6 +116,20 @@ class SlidingFeaturesConsumer:
     now_ms : callable, optional
         Wall-clock millisecond clock (injected for tests).  Defaults to
         :func:`_now_ms`.
+    txn_producer : TransactionalAvroProducer or None, optional
+        When supplied, switches the consumer to **transactional EOS** (design
+        week2_03 §2.4): the ``sliding-features`` and ``sliding-features-late``
+        writes plus the input-offset commit are produced through this single
+        transactional producer per poll-batch, and Redis is written only after
+        the transaction commits (§2.6).  ``None`` keeps the at-least-once path.
+    txn_config : TransactionalConfig or None, optional
+        EOS knobs (commit timeout) used when *txn_producer* is set.
+
+    Notes
+    -----
+    Under EOS the standalone ``kafka_sink`` / ``late_sink`` are not built — both
+    Kafka writes are multiplexed through *txn_producer* so they commit
+    atomically with the offset advance.
     """
 
     def __init__(
@@ -122,6 +145,8 @@ class SlidingFeaturesConsumer:
         kafka_config: KafkaConfig | None = None,
         registry_config: SchemaRegistryConfig | None = None,
         now_ms: Callable[[], int] = _now_ms,
+        txn_producer: TransactionalAvroProducer | None = None,
+        txn_config: TransactionalConfig | None = None,
     ) -> None:
         self._config = config
         self._kafka_config = kafka_config or KafkaConfig(
@@ -131,6 +156,14 @@ class SlidingFeaturesConsumer:
             url=config.registry_url
         )
         self._now_ms = now_ms
+        # EOS fields are set before building the consumer so _build_consumer can
+        # apply static membership (group.instance.id) under EOS.
+        self._txn_producer = txn_producer
+        self._txn_config = txn_config
+        self._eos = txn_producer is not None
+        self._commit_timeout_s = (
+            txn_config.commit_timeout_s if txn_config is not None else 30.0
+        )
         self._consumer = consumer if consumer is not None else self._build_consumer()
         self._manager = manager if manager is not None else SlidingWindowManager(
             allowed_lateness_ms=config.allowed_lateness_seconds * 1000
@@ -142,14 +175,25 @@ class SlidingFeaturesConsumer:
         self._redis_sink = redis_sink if redis_sink is not None else RedisHashSink(
             config
         )
-        self._kafka_sink = kafka_sink if kafka_sink is not None else (
-            KafkaSlidingFeaturesSink(
-                self._kafka_config, self._registry_config, topic=config.sink_topic
+        # Under EOS the two Kafka writes go through the single transactional
+        # producer (§2.4), so the standalone feature/late sinks are not built;
+        # they remain the at-least-once path's producers otherwise.
+        if self._eos:
+            self._kafka_sink = kafka_sink
+            self._late_sink = late_sink
+        else:
+            self._kafka_sink = kafka_sink if kafka_sink is not None else (
+                KafkaSlidingFeaturesSink(
+                    self._kafka_config, self._registry_config, topic=config.sink_topic
+                )
             )
-        )
-        self._late_sink = late_sink if late_sink is not None else KafkaLateEventsSink(
-            self._kafka_config, self._registry_config, topic=config.late_sink_topic
-        )
+            self._late_sink = late_sink if late_sink is not None else (
+                KafkaLateEventsSink(
+                    self._kafka_config,
+                    self._registry_config,
+                    topic=config.late_sink_topic,
+                )
+            )
         self._shutdown = threading.Event()
         self._consumed = 0
         self._late = 0
@@ -170,15 +214,21 @@ class SlidingFeaturesConsumer:
             from_dict=_passthrough_from_dict,
             return_record_name=True,
         )
-        return Consumer(
-            {
-                "bootstrap.servers": self._kafka_config.bootstrap_servers,
-                "security.protocol": self._kafka_config.security_protocol,
-                "group.id": self._config.consumer_group,
-                "auto.offset.reset": "latest",
-                "enable.auto.commit": False,
-            }
-        )
+        conf: dict[str, object] = {
+            "bootstrap.servers": self._kafka_config.bootstrap_servers,
+            "security.protocol": self._kafka_config.security_protocol,
+            "group.id": self._config.consumer_group,
+            "auto.offset.reset": "latest",
+            "enable.auto.commit": False,
+            # validated-events is produced transactionally under EOS, so read
+            # only past the LSO and drop aborted records (week2_03 §2.5).
+            "isolation.level": self._config.isolation_level,
+        }
+        if self._eos and self._txn_config and self._txn_config.group_instance_id:
+            # Static membership keeps transactional.id ⇄ partition stable across
+            # restarts (week2_03 §2.3 / §10.1).
+            conf["group.instance.id"] = self._txn_config.group_instance_id
+        return Consumer(conf)
 
     def request_shutdown(self) -> None:
         """Signal-handler-safe shutdown request.
@@ -207,6 +257,26 @@ class SlidingFeaturesConsumer:
             value = self._deserializer(bytes(value), ctx)
         return avro_dict_to_event(value)
 
+    def _fold_message(self, msg: Message):
+        """Decode and fold one message into pane state; return any late event.
+
+        Parameters
+        ----------
+        msg : confluent_kafka.Message
+            Source message.
+
+        Returns
+        -------
+        EcommerceEvent or None
+            The very-late event the manager rejected from its panes (for the
+            caller to route to the late sink), or ``None``.
+        """
+        event = self._decode(msg)
+        ts_ms = event_timestamp_ms(event)
+        self._watermark.observe(ts_ms)
+        watermark = self._watermark.watermark_ms(self._now_ms())
+        return self._manager.add(event, ts_ms, watermark, msg.partition())
+
     def _handle_message(self, msg: Message) -> None:
         """Fold one message into pane state, routing very-late events aside.
 
@@ -215,12 +285,7 @@ class SlidingFeaturesConsumer:
         msg : confluent_kafka.Message
             Source message.
         """
-        event = self._decode(msg)
-        ts_ms = event_timestamp_ms(event)
-        self._watermark.observe(ts_ms)
-        watermark = self._watermark.watermark_ms(self._now_ms())
-        partition = msg.partition()
-        late = self._manager.add(event, ts_ms, watermark, partition)
+        late = self._fold_message(msg)
         self._consumed += 1
         if late is not None:
             self._late_sink.write_raw(late)
@@ -237,12 +302,107 @@ class SlidingFeaturesConsumer:
             self._emitted[record.window_resolution] += 1
 
     def _poll_once(self) -> None:
-        """Run one poll → handle → emit → commit iteration."""
+        """Run one poll → handle → emit → commit iteration (at-least-once)."""
         msg = self._consumer.poll(self._config.poll_timeout_seconds)
         if msg is not None and msg.error() is None:
             self._handle_message(msg)
         self._emit_and_sink()
         self._consumer.commit(asynchronous=True)
+
+    def _collect_batch(self) -> list[Message]:
+        """Poll up to ``_EOS_MAX_RECORDS`` error-free messages for one txn.
+
+        Returns
+        -------
+        list of confluent_kafka.Message
+            The per-transaction poll-batch (possibly empty); design
+            week2_03 §2.7 — one transaction per batch, never per message.
+        """
+        batch: list[Message] = []
+        msg = self._consumer.poll(self._config.poll_timeout_seconds)
+        while msg is not None:
+            if msg.error() is None:
+                batch.append(msg)
+            if len(batch) >= _EOS_MAX_RECORDS:
+                break
+            msg = self._consumer.poll(0)
+        return batch
+
+    def _poll_batch_eos(self) -> None:
+        """Run one transactional consume → window → emit → commit batch.
+
+        Folds the batch into pane state, materializes the windows the watermark
+        has crossed, and — if there is anything to write or any offset to
+        advance — produces the late events + feature records through the single
+        transactional producer, binds the input offsets into the transaction,
+        and commits.  Redis is written only **after** the commit (design
+        week2_03 §2.6); counters advance post-commit so an abort leaves them
+        untouched.
+        """
+        batch = self._collect_batch()
+        lates = [
+            late
+            for late in (self._fold_message(msg) for msg in batch)
+            if late is not None
+        ]
+        watermark = self._watermark.watermark_ms(self._now_ms())
+        records = (
+            list(self._manager.emit_due_windows(watermark))
+            if watermark is not None
+            else []
+        )
+        if not batch and not records:
+            return  # nothing written and no offset advanced — open no txn
+        self._commit_batch_txn(lates, records)
+        for record in records:
+            self._redis_sink.write(record)
+            self._emitted[record.window_resolution] += 1
+        self._consumed += len(batch)
+        self._late += len(lates)
+
+    def _commit_batch_txn(self, lates: list, records: list) -> None:
+        """Produce the batch's Kafka writes + offsets atomically (design §2.4).
+
+        Parameters
+        ----------
+        lates : list of EcommerceEvent
+            Very-late raw events for ``sliding-features-late``.
+        records : list of SlidingFeatureRecord
+            Emitted feature records for ``sliding-features``.
+
+        Raises
+        ------
+        confluent_kafka.KafkaException
+            On any transactional error.  An *abortable* error aborts the
+            transaction and re-raises so the process exits and cold-starts
+            cleanly: re-folding the batch into the **live** in-memory panes
+            would double-count, so this stateful consumer treats an abort as a
+            mini-restart rather than an in-process retry (design week2_03
+            §2.8 / §2.10).
+        """
+        self._txn_producer.begin_transaction()
+        try:
+            for late in lates:
+                self._txn_producer.produce(
+                    self._config.late_sink_topic, late.user_id, late
+                )
+            for record in records:
+                self._txn_producer.produce(
+                    self._config.sink_topic, record.kafka_key(), record
+                )
+            self._txn_producer.send_offsets_to_transaction(
+                self._consumer.position(self._consumer.assignment()),
+                self._consumer.consumer_group_metadata(),
+            )
+            self._txn_producer.commit_transaction(self._commit_timeout_s)
+        except KafkaException as exc:
+            if requires_abort(exc):
+                logger.warning(
+                    f"sliding EOS transaction aborted; exiting for a clean "
+                    f"cold-start (in-process replay would double-count): {exc}"
+                )
+                self._txn_producer.abort_transaction(self._commit_timeout_s)
+            raise
 
     def run(self) -> SlidingRunSnapshot:
         """Run the loop until :meth:`request_shutdown` is set.
@@ -252,6 +412,8 @@ class SlidingFeaturesConsumer:
         SlidingRunSnapshot
             End-of-run counters for the results report.
         """
+        if self._eos:
+            self._txn_producer.init_transactions()
         self._consumer.subscribe(
             [self._config.source_topic],
             on_assign=self._on_assign,
@@ -259,13 +421,28 @@ class SlidingFeaturesConsumer:
         )
         try:
             while not self._shutdown.is_set():
-                self._poll_once()
+                if self._eos:
+                    self._poll_batch_eos()
+                else:
+                    self._poll_once()
         finally:
             self._shutdown_sinks()
         return self.snapshot()
 
     def _shutdown_sinks(self) -> None:
-        """Flush sinks, commit final offsets, and close every resource."""
+        """Flush sinks/producer, commit final offsets, and close resources.
+
+        Under EOS offsets are committed transactionally per batch, so the final
+        plain ``consumer.commit()`` is skipped (a non-transactional commit would
+        be wrong) and the single transactional producer is flushed/closed in
+        place of the standalone sinks.
+        """
+        if self._eos:
+            self._txn_producer.flush()
+            self._consumer.close()
+            self._txn_producer.close()
+            self._redis_sink.close()
+            return
         self._kafka_sink.flush()
         self._late_sink.flush()
         try:

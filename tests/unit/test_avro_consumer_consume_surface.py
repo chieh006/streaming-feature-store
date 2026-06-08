@@ -64,6 +64,23 @@ def test_isolation_level_read_committed_is_wired(
     assert c.isolation_level == "read_committed"
 
 
+def test_group_instance_id_omitted_by_default(
+    patched, kafka_config, registry_config
+) -> None:
+    _make(kafka_config, registry_config)
+    conf = patched["consumer_cls"].call_args.args[0]
+    assert "group.instance.id" not in conf
+
+
+def test_group_instance_id_set_when_provided(
+    patched, kafka_config, registry_config
+) -> None:
+    # Static membership keeps transactional.id ⇄ partition stable (§2.3/§10.1).
+    _make(kafka_config, registry_config, group_instance_id="validator-feed-0")
+    conf = patched["consumer_cls"].call_args.args[0]
+    assert conf["group.instance.id"] == "validator-feed-0"
+
+
 def test_subscribe_is_issued_once(
     patched, kafka_config, registry_config
 ) -> None:

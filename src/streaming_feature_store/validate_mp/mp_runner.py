@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from streaming_feature_store.config import KafkaConfig, SchemaRegistryConfig
 from streaming_feature_store.validate_mp.aggregator import aggregate_outcomes
@@ -46,6 +46,15 @@ class MultiprocessValidatorRunner:
         Defaults to ``"1.0.0"``.
     child_log_level : str, optional
         Python logging level passed to each child.  Defaults to ``"INFO"``.
+    eos : bool, optional
+        When ``True``, each member wraps its cycle in a transaction with a
+        per-process ``transactional.id`` (design week2_03 §2.3).  Defaults to
+        ``False``.
+    transaction_timeout_ms : int, optional
+        librdkafka ``transaction.timeout.ms`` for EOS members.  Default
+        ``60_000``.
+    commit_timeout_s : float, optional
+        ``commit_transaction`` budget for EOS members.  Default ``30.0``.
     """
 
     def __init__(
@@ -56,12 +65,18 @@ class MultiprocessValidatorRunner:
         *,
         validator_version: str = "1.0.0",
         child_log_level: str = "INFO",
+        eos: bool = False,
+        transaction_timeout_ms: int = 60_000,
+        commit_timeout_s: float = 30.0,
     ) -> None:
         self._kafka_config = kafka_config
         self._registry_config = registry_config
         self._mp_config = mp_config
         self._validator_version = validator_version
         self._child_log_level = child_log_level
+        self._eos = eos
+        self._transaction_timeout_ms = transaction_timeout_ms
+        self._commit_timeout_s = commit_timeout_s
 
     def _build_child_args(self) -> list[WorkerProcessArgs]:
         """Materialise per-member :class:`WorkerProcessArgs` bundles.
@@ -81,6 +96,9 @@ class MultiprocessValidatorRunner:
                 run_config=self._mp_config.to_per_process_run_config(i),
                 validator_version=self._validator_version,
                 log_level=self._child_log_level,
+                eos=self._eos,
+                transaction_timeout_ms=self._transaction_timeout_ms,
+                commit_timeout_s=self._commit_timeout_s,
             )
             for i in range(self._mp_config.members)
         ]
@@ -113,7 +131,7 @@ class MultiprocessValidatorRunner:
             Aggregate report.
         """
         args_list = self._build_child_args()
-        started_at = datetime.now(tz=timezone.utc)
+        started_at = datetime.now(tz=UTC)
         outcomes = self._spawn_children(args_list)
         report = aggregate_outcomes(
             config=self._mp_config,

@@ -10,6 +10,14 @@ commit*; a crash between the flush and the commit leaves the message
 twice on the destination topic, which downstream consumers absorb via
 idempotency keys (``event_id`` UUID for ``validated-events`` and
 ``f"{topic}:{partition}:{offset}"`` for the DLQ).  Design doc §2.7.
+
+The per-batch commit is delegated to an injectable
+:class:`~streaming_feature_store.eos.CommitStrategy` (design week2_03 §2.2):
+the default :class:`~streaming_feature_store.eos.AtLeastOnceCommit` keeps the
+flush-then-commit contract above, while
+:class:`~streaming_feature_store.eos.TransactionalCommit` wraps the batch in a
+Kafka transaction so the output writes and the input offsets commit-or-abort
+atomically (exactly-once on the Kafka side).
 """
 
 from __future__ import annotations
@@ -18,7 +26,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from confluent_kafka import KafkaError, KafkaException, Message
@@ -27,6 +35,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from streaming_feature_store.consumer.avro_consumer import (
     AvroEventConsumer,
     avro_dict_to_event,
+)
+from streaming_feature_store.eos import (
+    AtLeastOnceCommit,
+    CommitStrategy,
+    requires_abort,
 )
 from streaming_feature_store.producer.avro_producer import AvroEventProducer
 from streaming_feature_store.schemas import EcommerceEvent
@@ -165,6 +178,12 @@ class ValidatorRunner:
         Counter / latency aggregator.
     config : ValidatorRunConfig
         Per-run knobs.
+    commit_strategy : CommitStrategy, optional
+        End-of-batch commit behavior (design week2_03 §2.2).  Defaults to
+        :class:`~streaming_feature_store.eos.AtLeastOnceCommit` built from the
+        two producers — byte-for-byte today's flush-then-commit contract.
+        Pass a :class:`~streaming_feature_store.eos.TransactionalCommit`
+        (with both routes wired through one transactional producer) for EOS.
     validator_version : str, optional
         Semver of the validator catalog, surfaced in every DLQ record.
         Defaults to ``"1.0.0"``.
@@ -181,6 +200,7 @@ class ValidatorRunner:
         pipeline: ValidationPipeline,
         accountant: ValidatorAccountant,
         config: ValidatorRunConfig,
+        commit_strategy: CommitStrategy | None = None,
         validator_version: str = "1.0.0",
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -204,6 +224,9 @@ class ValidatorRunner:
         self._validator_version = validator_version
         self._clock = clock
         self._shutdown = threading.Event()
+        self._strategy: CommitStrategy = commit_strategy or AtLeastOnceCommit(
+            (validated_producer, dlq_producer), config.flush_timeout_s
+        )
 
     @property
     def config(self) -> ValidatorRunConfig:
@@ -326,19 +349,33 @@ class ValidatorRunner:
         elapsed_us = (self._clock() - started) * 1_000_000.0
         self._accountant.record_validation_latency_us(elapsed_us)
 
-    def _flush_and_commit(self) -> None:
-        """Flush both producers, then commit consumer offsets.
+    def _process_batch(self, messages: list[Message]) -> None:
+        """Handle one poll-batch under the active commit strategy.
 
-        Notes
-        -----
-        Ordering is load-bearing: a commit issued before the broker
-        acknowledges the produce would risk silent message loss after a
-        crash (design doc §2.7).
+        Opens the batch scope (``begin``), routes every message, then commits.
+        Under the transactional strategy an *abortable* error discards the
+        batch's produced output and leaves offsets unadvanced so the batch is
+        re-consumed; a fenced/fatal error propagates so the process exits
+        (design week2_03 §2.8).  Under the default at-least-once strategy
+        ``begin``/``abort`` are no-ops and ``commit`` is the load-bearing
+        flush-then-commit ordering (design doc §2.7).
+
+        Parameters
+        ----------
+        messages : list of confluent_kafka.Message
+            The non-empty poll-batch.
         """
-        cfg = self._config
-        self._validated_producer.flush(cfg.flush_timeout_s)
-        self._dlq_producer.flush(cfg.flush_timeout_s)
-        self._consumer.commit()
+        self._strategy.begin()
+        try:
+            for msg in messages:
+                self._handle_msg(msg)
+            self._strategy.commit(consumer=self._consumer)
+        except KafkaException as exc:
+            if requires_abort(exc):
+                logger.warning(f"aborting transaction; batch will replay: {exc}")
+                self._strategy.abort()
+                return
+            raise
 
     def run(self) -> ValidatorRunReport:
         """Run the loop until :meth:`request_shutdown` is set.
@@ -349,24 +386,23 @@ class ValidatorRunner:
             Frozen Pydantic report including the final accountant snapshot.
         """
         cfg = self._config
-        started_at = datetime.now(tz=timezone.utc)
+        started_at = datetime.now(tz=UTC)
+        self._strategy.init()
         self._consumer.subscribe()
         try:
             while not self._shutdown.is_set():
                 messages = self._consumer.poll_batch(
                     cfg.poll_timeout_s, cfg.poll_max_records
                 )
-                for msg in messages:
-                    self._handle_msg(msg)
                 if messages:
-                    self._flush_and_commit()
+                    self._process_batch(messages)
             # graceful shutdown: drain producers + commit any pending offsets
-            self._flush_and_commit()
+            self._strategy.finalize(consumer=self._consumer)
         finally:
             self._consumer.close()
             self._validated_producer.close()
             self._dlq_producer.close()
-        ended_at = datetime.now(tz=timezone.utc)
+        ended_at = datetime.now(tz=UTC)
         snapshot: ValidatorSnapshot = self._accountant.snapshot()
         report = ValidatorRunReport(
             source_topic=cfg.source_topic,

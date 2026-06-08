@@ -130,7 +130,7 @@ class RedisHashSink:
         self._redis.close()
         self._closed = True
 
-    def __enter__(self) -> "RedisHashSink":
+    def __enter__(self) -> RedisHashSink:
         """Return ``self`` for use as a context manager."""
         return self
 
@@ -312,7 +312,7 @@ class KafkaSlidingFeaturesSink:
             )
         self._closed = True
 
-    def __enter__(self) -> "KafkaSlidingFeaturesSink":
+    def __enter__(self) -> KafkaSlidingFeaturesSink:
         """Return ``self`` for use as a context manager."""
         return self
 
@@ -398,7 +398,7 @@ class KafkaLateEventsSink:
         self._producer.close()
         self._closed = True
 
-    def __enter__(self) -> "KafkaLateEventsSink":
+    def __enter__(self) -> KafkaLateEventsSink:
         """Return ``self`` for use as a context manager."""
         return self
 

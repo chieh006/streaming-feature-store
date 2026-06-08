@@ -257,7 +257,7 @@ class SlidingFeatureRecord(BaseModel):
         }
 
     @classmethod
-    def from_avro_dict(cls, d: dict) -> "SlidingFeatureRecord":
+    def from_avro_dict(cls, d: dict) -> SlidingFeatureRecord:
         """Reconstruct a record from an Avro-deserialized dict.
 
         Parameters
@@ -360,6 +360,11 @@ class SlidingConsumerConfig(BaseModel):
         Periodic emission tick when the poll loop is idle.
     poll_timeout_seconds : float
         Consumer ``poll`` timeout.
+    isolation_level : str
+        librdkafka ``isolation.level``.  Defaults to ``"read_committed"``
+        because ``validated-events`` is produced transactionally once EOS is
+        enabled, so this consumer must read only past the broker's Last Stable
+        Offset and filter aborted records (design week2_03 §2.5).
     num_workers : int
         Number of processes in the consumer group (design doc §2.11).
     warmup_seek_back : bool
@@ -386,6 +391,10 @@ class SlidingConsumerConfig(BaseModel):
     allowed_lateness_seconds: int = Field(default=30, ge=0)
     emit_tick_seconds: float = Field(default=1.0, gt=0.0)
     poll_timeout_seconds: float = Field(default=1.0, gt=0.0)
+    isolation_level: str = Field(
+        default="read_committed",
+        pattern=r"^(read_uncommitted|read_committed)$",
+    )
 
     num_workers: int = Field(default=1, ge=1, le=12)
     warmup_seek_back: bool = True
@@ -395,7 +404,7 @@ class SlidingConsumerConfig(BaseModel):
     ttl_factor: float = Field(default=1.5, gt=0.0)
 
     @model_validator(mode="after")
-    def _validate_cross_fields(self) -> "SlidingConsumerConfig":
+    def _validate_cross_fields(self) -> SlidingConsumerConfig:
         """Enforce distinct topics and a lateness below the smallest window.
 
         Returns

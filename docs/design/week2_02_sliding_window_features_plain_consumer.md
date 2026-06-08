@@ -117,7 +117,8 @@ The engine-agnostic core carries over verbatim:
 ### Out of scope (unchanged from the PyFlink design)
 
 Session-window features (gap plan line 82), EOS transactional wrapping
-(Week 2 PR #3), continuous per-event emission, HyperLogLog `distinct_products`,
+(Week 2 PR #3 — [`week2_03_exactly_once_transactions.md`](week2_03_exactly_once_transactions.md)),
+continuous per-event emission, HyperLogLog `distinct_products`,
 and cross-resolution merge — all remain deferred for the same reasons recorded
 in the superseded doc §1.
 
@@ -854,7 +855,7 @@ Constraints:
 3. **Two-level aggregation for hot keys.** The Zipfian feeder's top user gets
    ~10× average traffic; at higher rates pre-aggregate per `(user, salt)` then
    re-key. Laptop scale does not need it.
-4. **Transactional EOS wrapping (Week 2 PR #3).** `confluent-kafka` supports
+4. **Transactional EOS wrapping (Week 2 PR #3 — [`week2_03_exactly_once_transactions.md`](week2_03_exactly_once_transactions.md)).** `confluent-kafka` supports
    `init_transactions` / `send_offsets_to_transaction`; the consume→produce
    half becomes exactly-once, and the consumer default flips to
    `read_committed`. The Redis/Postgres cross-store atomicity still needs the
