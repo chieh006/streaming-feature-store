@@ -229,8 +229,9 @@ sink-report:  ## Open the latest sink-run report
 validator-run:  ## Start the single-process validator daemon in foreground
 	uv run python scripts/run_validator.py
 
-validator-run-mp:  ## Start the multi-process validator consumer group (default 4 procs)
-	uv run python scripts/run_validator_mp.py
+validator-run-mp:  ## Multi-process validator group. EOS=1 exactly-once; N=<procs> member count (default: auto-planned); SOURCE=feed|bench source mode (default: bench)
+	uv run python scripts/run_validator_mp.py \
+		$(if $(filter 1,$(EOS)),--eos,) $(if $(N),--procs $(N),) $(if $(SOURCE),--source $(SOURCE),)
 
 validator-up:  ## Daemonize the validator alongside feeder + sink
 	@mkdir -p $(PIDS_DIR)
@@ -276,10 +277,8 @@ validator-run-eos:  ## Run the validator with transactional EOS (validated+dlq+o
 		--registry http://localhost:8081 \
 		--report-path docs/results/week2_eos_results.md
 
-validator-run-mp-eos:  ## Run the multi-process validator with EOS (per-member transactional.id)
-	uv run python scripts/run_validator_mp.py --eos \
-		--bootstrap localhost:19092,localhost:19093,localhost:19094 \
-		--registry http://localhost:8081
+validator-run-mp-eos:  ## Alias for `validator-run-mp EOS=1` (per-member transactional.id, §2.3); pass N=<procs> to set member count
+	@$(MAKE) --no-print-directory validator-run-mp EOS=1 N=$(N)
 
 eos-verify:  ## Read validated-events at read_committed (only committed, non-aborted records)
 	docker compose -f $(COMPOSE_FILE) exec kafka-1 \

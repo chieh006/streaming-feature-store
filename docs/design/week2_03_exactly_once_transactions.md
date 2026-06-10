@@ -788,10 +788,12 @@ make register-schemas-feed     # feeder subject; validated/sliding/dlq self-regi
 
 ```
 make feeder-run                       # ~200 evt/s non-txn feeder (upstream)
-make validator-run-eos                # validator with --eos (txn: validated+dlq)
+make validator-run-eos                # single-proc validator with --eos (1 txn scope: validated+dlq)
+# — OR, to demonstrate the multi-member EOS group (each member its own
+#   transactional.id → N txn scopes, §2.3), run this INSTEAD of the line above.
+#   SOURCE=feed points it at the feeder's topic (default is the bench topic):
+make validator-run-mp EOS=1 N=4 SOURCE=feed
 make sliding-run-eos                  # sliding consumer with --eos (txn: features)
-# multi-process EOS group (each member its own transactional.id, §2.3):
-make validator-run-mp EOS=1 N=4
 ```
 
 ### 7.3 Verify exactly-once (read at the LSO)
