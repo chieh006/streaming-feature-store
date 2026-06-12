@@ -924,6 +924,19 @@ probing "you said you built exactly-once, explain it" will dig into. Each is
 tied to the concrete code that implements it, with the question it tends to
 unlock.
 
+> **Ordering note.** The items follow conceptual dependency order (the atomic
+> unit → the identity/fencing machinery that protects it → the consumer half
+> that makes it observable → the boundary where it stops → the
+> codebase-specific abort subtlety) — *not* strict interview criticality.
+> Ranked by criticality for a Senior/Staff ML-infra loop, study them as:
+> **11.1** (the atomic unit — the definitional core most candidates get
+> wrong) > **11.4** (Kafka txn ≠ cross-store atomicity — the staff-level
+> boundary question, and the one this *feature-store* project will be asked:
+> "does it cover Redis?") > **11.3** (read_committed/LSO — the classic
+> "still seeing duplicates" gotcha) > **11.2** (fencing — commonly asked,
+> but mechanism recall) > **11.5** (stateful abort — deep-cut differentiator,
+> shines in follow-up depth).
+
 ### 11.1 The atomic unit is `{output records} + {input offsets}`, not just the writes
 
 This is the single most important idea, and the one most candidates get wrong.

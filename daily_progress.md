@@ -3,7 +3,9 @@
 
 ## 2026-06-11
 - Completed verification of `week2_03_exactly_once_transactions.md`.
-
+- Complete `week2_03_exactly_once_transactions.md`.
+- Created design doc `week3_01_feature_serving_api.md`.
+- *TODO*: Execute `week3_01_feature_serving_api.md`.
 
 ## 2026-06-09
 - Verify `week2_03_exactly_once_transactions.md` (WIP - ### 7.2). 
