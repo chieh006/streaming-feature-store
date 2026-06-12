@@ -33,6 +33,7 @@ only the **transactional wrapping** is new.
 8. [Resource Budget & Constraints](#8-resource-budget--constraints)
 9. [Future Considerations](#9-future-considerations)
 10. [Open Questions](#10-open-questions)
+11. [Top 5 Concepts Worth Understanding (Interview Prep)](#11-top-5-concepts-worth-understanding-interview-prep)
 
 ---
 
@@ -915,3 +916,130 @@ Constraints:
    a Postgres sink pointed at it read `read_committed` (cleaner offline dataset)
    even though its own write stays at-least-once? Likely yes — note for the
    Week 4 batch source choice.
+
+## 11. Top 5 Concepts Worth Understanding (Interview Prep)
+
+These are the five load-bearing ideas in this PR — the ones an interviewer
+probing "you said you built exactly-once, explain it" will dig into. Each is
+tied to the concrete code that implements it, with the question it tends to
+unlock.
+
+### 11.1 The atomic unit is `{output records} + {input offsets}`, not just the writes
+
+This is the single most important idea, and the one most candidates get wrong.
+Exactly-once on a consume-process-produce loop is **not** "produce idempotently."
+It is: *the output records and the consumer offset that says "I read these
+inputs" commit or abort together, as one Kafka transaction.* The offset advance
+is bound into the transaction via
+[`send_offsets_to_transaction`](../../src/streaming_feature_store/sliding/consumer.py#L393-L396)
+— which writes the offsets to the internal `__consumer_offsets` topic *as part
+of the producer's transaction*, not via a separate `consumer.commit()`. So a
+crash can never leave outputs committed but offsets behind (duplicate on replay)
+or offsets committed but outputs missing (data loss). The ordering in
+[`_commit_batch_txn`](../../src/streaming_feature_store/sliding/consumer.py#L363-L405)
+is the whole pattern: `begin → produce(all topics) → send_offsets → commit`.
+
+**Mental model in one line:**
+
+> read (non-atomic) → process → **[ produce outputs + write source-offset to
+> `__consumer_offsets` ]** atomic via one producer transaction → only then Redis
+> (idempotent, outside).
+
+The read/`poll()` is *not* in the transaction — it just fetches and moves the
+in-memory cursor. What is atomic is the **produce + the source-offset commit**:
+both are partition writes (`sliding-features` / `sliding-features-late` and the
+`__consumer_offsets` partition for the group), so the *same* transaction
+coordinator commits them together with the same commit markers. The offset is
+only advanced if the produce committed — abort leaves it untouched and the batch
+re-reads from the last committed source offset.
+
+- **Likely question:** *"How is consume-process-produce exactly-once different
+  from an idempotent producer?"* Answer: idempotence dedupes retries of a single
+  producer session; it says nothing about the consumer offset. EOS makes the
+  offset commit part of the same atomic write as the output, closing the
+  read-process-write loop.
+
+### 11.2 `transactional.id`, producer epoch, and zombie fencing
+
+A transactional producer needs a `transactional.id` that is **stable across
+restarts** (so the coordinator recognizes a restarted process as the *same*
+producer) yet **unique across live processes** (two live producers sharing an id
+fence each other in a loop). `f"{group_id}-{ordinal}"` —
+[`derive_transactional_id`](../../src/streaming_feature_store/eos/transactional_id.py#L18-L52)
+— satisfies both. At startup
+[`init_transactions()`](../../src/streaming_feature_store/sliding/consumer.py#L416)
+registers the id with the transaction coordinator, **bumps the producer epoch**,
+and aborts any dangling transaction from a crashed predecessor. If a stalled
+"zombie" (GC pause, SIGSTOP past `transaction.timeout.ms`) later tries to commit,
+its now-stale epoch is **fenced** and the commit fails. Note the load-bearing
+caveat: with N workers this is **N independent transactions, not one distributed
+transaction** — correct because each input partition is owned by exactly one
+member, so no two transactions ever cover the same record. Static membership
+(`group.instance.id`) keeps the id ⇄ partition mapping stable across restarts.
+
+- **Likely question:** *"Two instances of the same job are running — how does
+  Kafka prevent the dead one from corrupting state?"* Answer: producer epoch
+  fencing, established by `init_transactions`.
+
+### 11.3 EOS is invisible without `read_committed` (the LSO half)
+
+The producer side is only half the system. A transaction's outputs are
+unobservable as "exactly once" unless the *downstream consumer* reads with
+[`isolation.level=read_committed`](../../src/streaming_feature_store/sliding/consumer.py#L225).
+That tells the broker to deliver only records **below the Last Stable Offset
+(LSO)** — records whose transaction has committed — and to **filter out aborted
+records entirely**. With `read_uncommitted`, a reader still sees the duplicate
+emissions from a replayed/aborted batch and the whole transactional apparatus is
+pointless. That is why this PR *flips the default* to `read_committed` (§2.5):
+shipping EOS means shipping both halves. The cost is **consumer-side latency**,
+not throughput — records are held back until their transaction commits, so
+end-to-end latency now includes the commit cadence.
+
+- **Likely question:** *"You enabled transactions but still see duplicates
+  downstream — why?"* Answer: the reader is `read_uncommitted`; aborted/replayed
+  records below the LSO are only filtered for a `read_committed` consumer.
+
+### 11.4 Kafka transactions ≠ cross-store atomicity (the Redis/Postgres boundary)
+
+A Kafka transaction's atoms are **Kafka partitions** (topic-partitions + the
+`__consumer_offsets` partition). It **cannot** enlist Redis or Postgres — no
+Kafka API spans them. So those writes stay **outside** the transaction on an
+**idempotent-write** contract (Redis latest-wins `HSET`, Postgres `ON CONFLICT
+DO NOTHING`). The concrete consequence is the **commit-then-Redis ordering** in
+[`_poll_batch_eos`](../../src/streaming_feature_store/sliding/consumer.py#L356-L361):
+Redis is written *only after* `commit_transaction()` returns, so the online
+store never reflects an *aborted* feature value. The residual window — Kafka
+committed but the process dies before the Redis write — leaves Redis briefly
+stale and is reconciled by the next latest-wins overwrite. The "proper" fix
+(genuine Kafka↔Redis↔Postgres atomicity) is the **outbox pattern**, designed but
+deferred (§9.1).
+
+- **Likely question:** *"Does your exactly-once cover the feature you write to
+  Redis?"* Answer: no — Kafka transactions stop at Kafka's boundary; Redis is
+  effectively-once via idempotent latest-wins writes, ordered after the commit.
+
+### 11.5 Stateful abort = mini-restart, not in-process retry
+
+This is the subtle, codebase-specific deep cut that separates a memorized answer
+from real understanding. On an *abortable* error
+([`requires_abort`](../../src/streaming_feature_store/eos/commit_strategy.py#L27-L53)
+checks the native `KafkaError.txn_requires_abort()`), a **stateless** loop (the
+validator) can simply `abort_transaction()` and re-consume the batch in-process.
+But the **stateful** sliding consumer has *already folded the batch's events into
+its in-memory panes* before the produce/commit. Re-folding the same batch
+in-process would **double-count**. So it treats an abort as a **mini-restart**:
+abort, then **re-raise so the process exits**
+([`_commit_batch_txn`](../../src/streaming_feature_store/sliding/consumer.py#L398-L405)),
+and the §2.10 cold-start warm-up rebuilds pane state from the (un-advanced)
+committed offsets. This is the price of holding mutable state outside the
+transaction — and the exact point where the design notes that *truly*
+rollback-able large state is the trigger to reach for Flink's checkpointed EOS.
+(Related: the transaction boundary is **one poll-batch** capped at
+[`_EOS_MAX_RECORDS = 500`](../../src/streaming_feature_store/sliding/consumer.py#L60),
+never per message — per-message commits would multiply transaction-marker write
+amplification and collapse throughput.)
+
+- **Likely question:** *"On a transaction abort, why not just retry the batch in
+  memory?"* Answer: because in-memory aggregation state already absorbed the
+  batch; replaying it would double-count, so a stateful consumer must discard and
+  rebuild from the committed offset.
