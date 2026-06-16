@@ -683,12 +683,21 @@ Marked `@pytest.mark.integration` (require `make infra-up`):
 
 ```sh
 make infra-up          # Kafka ×3 + Schema Registry + PostgreSQL + Redis
-uv sync --extra serving --extra sliding
+make install           # one-time: Python deps incl. fastapi/uvicorn/redis
+                       #   (= uv pip install -e ".[test]"; the test extra now
+                       #   carries the serving deps and the sliding-run deps)
 ```
 
 ### 7.2 Populate the online store, then serve
 
 ```sh
+make register-schemas-feed  # registers e-commerce-events-feed-value in the
+                            #   Schema Registry — required before the feeder.
+                            #   The producer uses auto.register.schemas=False,
+                            #   so a fresh stack (or `infra-up` after a
+                            #   `down -v`) needs this once or `feeder-run`
+                            #   fails with SR 40401 (subject not found).
+
 make feeder-run &      # background event feeder (Week 1)
 make validator-run &   # validation layer (Week 2 PR #1)
 make sliding-run &     # sliding-window consumer → Redis (Week 2 PR #2)
@@ -703,6 +712,8 @@ make serving-run-group W=4
 ```sh
 # Pick a hot user from the store, then hit the API:
 make sliding-redis-show
+# `u-000042` is just a placeholder matching the feeder's u-NNNNNN id format;
+# substitute a real id printed by `make sliding-redis-show` above.
 curl -s localhost:8000/v1/features/users/u-000042 | python -m json.tool
 
 # Cold user — 200, zeros, key_present=false (§2.3):
@@ -818,9 +829,20 @@ The whole sub-5 ms story is **data layout**, not cleverness: all of a user's
 features live in one Redis hash, so a feature vector is a single O(13)
 `HGETALL` — one network RTT, one store operation, no joins, no fan-out. Every
 serving-latency war story (N+1 key reads, cross-shard fan-out, "we added a
-cache because reads were slow") is downstream of getting this layout wrong.
-The hash was *designed* for this read in Week 2 §2.8 before the reader
-existed — write contracts should be designed from the read path backwards.
+cache because reads were slow") is downstream of getting this layout wrong,
+because the read access pattern is fixed — *given one `user_id`, return all 13
+features fast* — while the write is negotiable, so you bend the write contract
+and the data layout to serve the read, never the reverse. The hash was
+*designed* for this read in Week 2 §2.8 before the reader existed — the
+read-path-backwards reasoning behind denormalization, materialized views, and
+NoSQL modeling, where you pay once at write time (and in storage) so every
+read is a single cheap lookup; it is the right trade precisely because a
+feature store is read-heavy (written periodically by the window consumer, read
+on every prediction request), so the rule generalizes to: let the *dominant*
+access pattern drive the layout.
+
+**TL;DR:** one hash per user makes a feature read a single fixed-cost
+round trip — design the write layout backwards from the read.
 
 ### 11.2 Sparsity and default-zero: why the writer never writes zeros
 
@@ -859,11 +881,63 @@ group reached, now at the serving edge. One system, one rule, three layers:
 
 The API's own p99 (<5 ms) is the *smallest* term in end-to-end staleness. A
 feature value a client reads is at best as fresh as: producer latency
-(`acks=all` under EOS — Week 1 §4.4.1) + validation hop + **slide cadence**
-(a 5 m/1 m window updates at most once a minute) + watermark delay
+(`acks=all` under EOS — Week 1 §4.4.1) + validation hop + **window refresh
+interval** (the window's *slide* — a 5 m/1 m window updates at most once a
+minute) + watermark delay
 (out-of-orderness budget, Week 2 §2.4) + Redis write. There is no
 read-your-writes guarantee — an event a client just produced is invisible
-until its window fires. Articulating that the serving SLA and the freshness
-SLA are different numbers, composed from different pipeline stages, is
-precisely the online/offline-consistency literacy Week 4 then makes
-quantitative.
+until its window fires. The store is therefore **eventually consistent** with
+the event stream; more precisely it offers **bounded staleness** — because the
+freshness gap above is a *sum of known stage latencies* (window refresh
+interval + watermark delay + write), the lag has a knowable upper bound rather than the
+unbounded "eventually" of plain eventual consistency, assuming a healthy
+pipeline that is not backed up. Articulating that the serving SLA (read-path latency —
+p99 < 5 ms) and the freshness SLA (end-to-end staleness — producer +
+validation + window refresh interval + watermark + Redis write, on the order of seconds
+to minutes) are different numbers composed from different pipeline stages is
+the core online/offline-consistency literacy: a read can be answered in
+milliseconds yet return a value a minute old, so "fast to answer" never
+implies "fresh or consistent." Week 4 then makes this quantitative —
+measuring the online value against an offline recomputation to put real
+numbers on the divergence (train/serve skew).
+
+**TL;DR:** "fast to answer" (5 ms serving SLA) is not "fresh" (seconds-to-minutes
+freshness SLA) — the API's read is the smallest contributor to total staleness;
+the upstream stages (mainly the window refresh interval and watermark delay) dominate.
+
+## Appendix A: Why the freshness gap is "eventual consistency", not CAP's "C"
+
+The §11.5 staleness is sometimes mislabeled as a CAP-theorem *Consistency*
+tradeoff. It is not. The precise term is **eventual consistency** (more
+sharply, **bounded staleness**), and the distinction matters:
+
+* **CAP's "C" is only defined *during a network partition.*** CAP states that
+  *when the network splits so nodes cannot communicate*, a system must
+  sacrifice Consistency or Availability. (Note the naming collision: the "P"
+  in CAP is a **network split / communication failure** — unrelated to a
+  *Kafka* partition, which is a deliberate topic shard.) The §11.5 staleness
+  exists under **perfectly healthy networking**, all the time, by design — no
+  partition is involved, so the CAP choice is never invoked.
+
+* **CAP's "C" (linearizability) is about *replicas of one value disagreeing*;
+  our gap is *one value still in transit through pipeline stages.*** CAP-C
+  describes two copies of the same register disagreeing *because they cannot
+  sync*. Our lag is a single event still flowing through
+  produce → validate → window-fire → Redis write — propagation latency, not
+  replica disagreement. Same symptom ("the read is not current"), different
+  cause.
+
+* **The lag is bounded and deliberate.** Because the freshness gap is a *sum
+  of known stage latencies* (window refresh interval + watermark delay + write), it has
+  a knowable upper bound — **bounded staleness**, stronger than the unbounded
+  "eventually" of plain eventual consistency (assuming a healthy pipeline that
+  is not backed up). Watermarks and the window refresh interval *intentionally* hold data to
+  emit correct windows; we trade a little freshness for correctness, not
+  because a failure forced us to.
+
+* **The framework that fits is PACELC, not CAP.** PACELC extends CAP with the
+  missing normal-operation case: *if Partitioned, choose Availability or
+  Consistency; **Else** (no partition), choose **L**atency or **C**onsistency.*
+  §11.5 lives in that "ELC" branch — in normal operation we trade Consistency
+  (freshness) for Latency (the p99 < 5 ms read path). CAP only covers the
+  partition branch.

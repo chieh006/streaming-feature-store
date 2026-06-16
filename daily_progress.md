@@ -1,11 +1,19 @@
 # Daily Progress
 
+## 2026-06-15
+- Verified `week3_01_feature_serving_api.md`.
+- Read through ### 11.5, ### 11.1. 
+- *TODO*: read through the rest in ## 11.
+
+
+## 2026-06-14
+- Executed `week3_01_feature_serving_api.md`.
+
 
 ## 2026-06-11
 - Completed verification of `week2_03_exactly_once_transactions.md`.
 - Complete `week2_03_exactly_once_transactions.md`.
 - Created design doc `week3_01_feature_serving_api.md`.
-- *TODO*: Execute `week3_01_feature_serving_api.md`.
 
 ## 2026-06-09
 - Verify `week2_03_exactly_once_transactions.md` (WIP - ### 7.2). 

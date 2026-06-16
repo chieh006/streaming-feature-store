@@ -9,11 +9,18 @@ import pytest
 from pydantic import ValidationError
 
 from streaming_feature_store.schemas.loader import SCHEMAS_ROOT, load_avro_file
+from streaming_feature_store.serving.models import FeatureVector
+from streaming_feature_store.sliding.aggregators import AGGREGATOR_BY_RESOLUTION
 from streaming_feature_store.sliding.models import (
+    _REDIS_FIELD_PREFIXES,
+    REDIS_FIELD_PREFIXES,
+    RESOLUTION_FEATURES,
+    SlidingAccumulator,
     SlidingConsumerConfig,
     SlidingFeatureRecord,
     WindowResolution,
     event_timestamp_ms,
+    expected_redis_fields,
 )
 
 _AVSC_PATH = SCHEMAS_ROOT / "sliding" / "v1" / "sliding_feature_record.avsc"
@@ -209,3 +216,53 @@ def test_config_rejects_non_positive_ttl_factor() -> None:
 )
 def test_ttl_seconds_for(resolution, ttl) -> None:
     assert SlidingConsumerConfig().ttl_seconds_for(resolution) == ttl
+
+
+# ---------------------------------------------------------------------------
+# Read-side contract drift guards (design week3_01 §2.2 / §5)
+# ---------------------------------------------------------------------------
+
+
+def _populated_prefixes(resolution: WindowResolution) -> set[str]:
+    """Return the Redis prefixes a resolution's aggregator actually populates.
+
+    Builds a fully-populated accumulator (clicks + page-views + a purchase, so
+    ``avg_purchase_amount`` avoids its no-purchase ``None``), projects it via
+    ``get_result``, and maps every non-``None`` record field to its Redis
+    prefix — the ground truth the serving layer must mirror.
+    """
+    aggregator = AGGREGATOR_BY_RESOLUTION[resolution]()
+    acc = SlidingAccumulator(
+        user_id="u",
+        click_count=1,
+        page_view_count=1,
+        purchase_count=1,
+        revenue=10.0,
+        distinct_products={"a"},
+    )
+    record = aggregator.get_result(acc)
+    return {
+        prefix
+        for field_name, prefix in REDIS_FIELD_PREFIXES.items()
+        if getattr(record, field_name) is not None
+    }
+
+
+@pytest.mark.parametrize("resolution", list(WindowResolution))
+def test_resolution_features_match_aggregators(resolution) -> None:
+    assert set(RESOLUTION_FEATURES[resolution]) == _populated_prefixes(resolution)
+
+
+def test_feature_vector_fields_equal_expected_redis_fields() -> None:
+    assert set(FeatureVector.model_fields.keys()) == expected_redis_fields()
+
+
+def test_redis_field_prefixes_alias_identity() -> None:
+    assert REDIS_FIELD_PREFIXES is _REDIS_FIELD_PREFIXES
+
+
+def test_expected_redis_fields_has_thirteen_members() -> None:
+    fields = expected_redis_fields()
+    assert len(fields) == 13
+    assert "clicks_5m" in fields
+    assert "avg_purchase_amount_24h" in fields

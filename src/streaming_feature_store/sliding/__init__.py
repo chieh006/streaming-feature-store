@@ -21,11 +21,14 @@ from streaming_feature_store.sliding.consumer import (
     SlidingRunSnapshot,
 )
 from streaming_feature_store.sliding.models import (
+    REDIS_FIELD_PREFIXES,
+    RESOLUTION_FEATURES,
     SlidingAccumulator,
     SlidingConsumerConfig,
     SlidingFeatureRecord,
     WindowResolution,
     event_timestamp_ms,
+    expected_redis_fields,
 )
 from streaming_feature_store.sliding.panes import (
     PanedSlidingWindow,
@@ -41,6 +44,8 @@ from streaming_feature_store.sliding.watermark import WatermarkTracker
 
 __all__ = [
     "AGGREGATOR_BY_RESOLUTION",
+    "REDIS_FIELD_PREFIXES",
+    "RESOLUTION_FEATURES",
     "FiveMinuteAggregator",
     "KafkaLateEventsSink",
     "KafkaSlidingFeaturesSink",
@@ -58,5 +63,6 @@ __all__ = [
     "WatermarkTracker",
     "WindowResolution",
     "event_timestamp_ms",
+    "expected_redis_fields",
     "load_sliding_schema_str",
 ]

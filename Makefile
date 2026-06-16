@@ -16,6 +16,7 @@ PIDS_DIR := .pids
         validator-report validator-run-eos validator-run-mp-eos eos-verify eos-report \
         redis-cli \
         sliding-run sliding-run-group sliding-run-eos sliding-report sliding-redis-show \
+        serving-run serving-run-group serving-smoke \
         test test-unit test-integration install
 
 # ---------------------------------------------------------------------------
@@ -325,3 +326,24 @@ sliding-report:  ## Open the latest sliding-features results report
 sliding-redis-show:  ## Dump a sample of the Redis feat:user:* hashes (10 keys)
 	@docker compose -f $(COMPOSE_FILE) exec redis sh -c \
 	  "redis-cli --scan --pattern 'feat:user:*' | head -10 | xargs -I {} sh -c 'echo \"=== {} ===\"; redis-cli HGETALL {}'"
+
+# ---------------------------------------------------------------------------
+# Online feature-serving API (Week 3 PR #1)
+# Read-only FastAPI service over the Redis online store; scales via uvicorn
+# worker processes, not threads (design week3_01_feature_serving_api.md §2.6).
+# Redis is started by `make infra-up` along with the rest of the stack.
+# ---------------------------------------------------------------------------
+
+serving-run:  ## Run the feature-serving API (single worker, foreground, port 8000)
+	uv run python scripts/run_feature_api.py --redis-host localhost
+
+serving-run-group:  ## Run the API with W uvicorn worker processes (default W=4): make serving-run-group W=4
+	uv run python scripts/run_feature_api.py --redis-host localhost --workers $(or $(W),4)
+
+serving-smoke:  ## Crude latency sanity: N sequential curls (default N=20): make serving-smoke N=20 USER=u-000042
+	@user="$(or $(USER_ID),u-000042)"; n="$(or $(N),20)"; \
+	  echo "Hitting /v1/features/users/$$user x$$n on localhost:8000"; \
+	  for i in $$(seq 1 $$n); do \
+	    curl -s -o /dev/null -w "%{time_total}s\n" \
+	      "localhost:8000/v1/features/users/$$user"; \
+	  done

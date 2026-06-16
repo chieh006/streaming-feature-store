@@ -288,7 +288,10 @@ class SlidingFeatureRecord(BaseModel):
 
 # Mapping from record field name to the Redis-field prefix (design doc §2.8 /
 # §7.3): counts are pluralised, monetary / cardinality fields keep their names.
-_REDIS_FIELD_PREFIXES: dict[str, str] = {
+# Public name; the old private name is kept as a deprecated alias so the write
+# path (:meth:`SlidingFeatureRecord.redis_field_updates`) is untouched
+# (design week3_01 §2.2 / §4.1).
+REDIS_FIELD_PREFIXES: dict[str, str] = {
     "click_count": "clicks",
     "page_view_count": "page_views",
     "purchase_count": "purchases",
@@ -296,6 +299,47 @@ _REDIS_FIELD_PREFIXES: dict[str, str] = {
     "distinct_products": "distinct_products",
     "avg_purchase_amount": "avg_purchase_amount",
 }
+_REDIS_FIELD_PREFIXES = REDIS_FIELD_PREFIXES  # deprecated alias (write path)
+
+# Which feature prefixes each resolution's aggregator populates (design
+# week3_01 §2.2).  Mirrors ``{Five,OneHour,TwentyFourHour}Aggregator.get_result``
+# and is pinned to them by
+# ``tests/unit/test_sliding_models.py::test_resolution_features_match_aggregators``
+# so contract drift is a CI failure, not a silent all-zeros read.
+RESOLUTION_FEATURES: dict[WindowResolution, tuple[str, ...]] = {
+    WindowResolution.W_5M_SLIDE_1M: ("clicks", "page_views", "purchases", "revenue"),
+    WindowResolution.W_1H_SLIDE_5M: (
+        "clicks",
+        "page_views",
+        "purchases",
+        "revenue",
+        "distinct_products",
+    ),
+    WindowResolution.W_24H_SLIDE_1H: (
+        "purchases",
+        "revenue",
+        "distinct_products",
+        "avg_purchase_amount",
+    ),
+}
+
+
+def expected_redis_fields() -> frozenset[str]:
+    """Full universe of online-store hash fields (the 13-field contract).
+
+    Returns
+    -------
+    frozenset of str
+        Every ``"{prefix}_{resolution}"`` combination a conformant
+        :class:`~streaming_feature_store.sliding.sinks.RedisHashSink` may write
+        — the exact field set the Week 3 serving layer types and defaults
+        (design week3_01 §2.2).
+    """
+    return frozenset(
+        f"{prefix}_{resolution.value}"
+        for resolution, prefixes in RESOLUTION_FEATURES.items()
+        for prefix in prefixes
+    )
 
 
 def _format_redis_value(value: int | float) -> str:
